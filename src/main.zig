@@ -64,18 +64,26 @@ pub fn main() void {
         if (!in_memory) journal.deinit();
     }
 
-    var schema_store = zqlite.schema.Schema.init(allocator);
-    defer schema_store.deinit();
-
     // Persistent arena for executor-owned strings (table names, column names).
-    // Freed on exit — avoids leak warnings from the GPA debug checker.
+    // Also used by the schema store so all schema string allocations are
+    // bulk-freed on exit — avoids leak warnings from the GPA debug checker.
     var exec_arena = std.heap.ArenaAllocator.init(allocator);
     defer exec_arena.deinit();
 
+    var schema_store = zqlite.schema.Schema.init(exec_arena.allocator());
+    defer schema_store.deinit();
+
+
+
+
     var exec = zqlite.executor.Executor.init(exec_arena.allocator(), &pool, &schema_store);
+    exec.setFile(&fh);
     if (!in_memory) {
         exec.setJournal(&journal);
     }
+
+    // Load persisted schema from page 0 (table definitions, column info, rowid counters)
+    exec.loadSchemaFromDisk();
 
     if (in_memory) {
         print("Running in memory mode (no ACID guarantees).\n\n", .{});

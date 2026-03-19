@@ -3,6 +3,7 @@ const ast = @import("ast.zig");
 const btree = @import("btree.zig");
 const cursor = @import("cursor.zig");
 const journal_mod = @import("journal.zig");
+const os = @import("os.zig");
 const pager = @import("pager.zig");
 const record = @import("record.zig");
 const schema = @import("schema.zig");
@@ -126,6 +127,7 @@ pub const Executor = struct {
     next_page: u32,
     journal: ?*journal_mod.Journal,
     in_transaction: bool,
+    file: ?*os.FileHandle,
 
     const Self = @This();
 
@@ -137,7 +139,34 @@ pub const Executor = struct {
             .next_page = 1,
             .journal = null,
             .in_transaction = false,
+            .file = null,
         };
+    }
+
+    /// Set the file handle for schema persistence.
+    pub fn setFile(self: *Self, f: *os.FileHandle) void {
+        self.file = f;
+    }
+
+    /// Load schema from page 0 of the database file.
+    /// Call this on startup before any SQL execution.
+    pub fn loadSchemaFromDisk(self: *Self) void {
+        const fh = self.file orelse return;
+        if (fh.file_size < fh.page_size) return; // No page 0 yet
+
+        var page_buf: [os.MAX_PAGE_SIZE]u8 = undefined;
+        fh.readPage(0, page_buf[0..fh.page_size]) catch return;
+        _ = self.schema_store.loadSchema(page_buf[0..fh.page_size]);
+    }
+
+    /// Persist schema to page 0 of the database file (direct I/O, bypasses buffer pool).
+    fn persistSchema(self: *Self) void {
+        const fh = self.file orelse return;
+        var page_buf: [os.MAX_PAGE_SIZE]u8 = undefined;
+        const buf = page_buf[0..fh.page_size];
+        self.schema_store.saveSchema(buf);
+        fh.writePage(0, buf) catch {};
+        fh.sync() catch {};
     }
 
     /// Attach a journal for ACID transactions.
@@ -254,7 +283,17 @@ pub const Executor = struct {
             return ExecError.TableAlreadyExists;
         }
 
-        // Create a B-tree for this table
+        // Reserve page 0 for schema on a fresh database.
+        // allocatePage() uses file.pageCount() as the new page id, so we
+        // write an empty schema page first to bump the count to 1.
+        if (self.file) |fh| {
+            if (fh.file_size == 0) {
+                // Write initial empty schema header to page 0
+                self.persistSchema();
+            }
+        }
+
+        // Create a B-tree for this table (gets page 1+ since page 0 is reserved)
         const bt = btree.Btree.create(self.pool, btree.PAGE_TYPE_TABLE_LEAF) catch
             return ExecError.StorageError;
 
@@ -291,6 +330,9 @@ pub const Executor = struct {
             .rowid_alias_col = pk_col,
         }) catch return ExecError.StorageError;
 
+        // Persist schema to disk
+        self.persistSchema();
+
         return ExecResult{
             .rows = &.{},
             .column_names = &.{},
@@ -313,6 +355,8 @@ pub const Executor = struct {
             }
             return ExecError.TableNotFound;
         }
+        // Persist schema to disk
+        self.persistSchema();
         return ExecResult{
             .rows = &.{},
             .column_names = &.{},
@@ -372,6 +416,9 @@ pub const Executor = struct {
 
             rows_inserted += 1;
         }
+
+        // Persist schema (next_rowid may have changed)
+        self.persistSchema();
 
         return ExecResult{
             .rows = &.{},
