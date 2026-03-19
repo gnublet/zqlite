@@ -1,0 +1,15 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Compiled binaries
+main
+
+# Test databases
+*.db
+*.db-wal
+*.db-journal
+
+# OS files
+.DS_Store
+Thumbs.db
