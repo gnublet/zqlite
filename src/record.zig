@@ -117,8 +117,13 @@ pub fn putVarint(buf: []u8, value: u64) RecordError!usize {
 pub fn getVarint(buf: []const u8) RecordError!struct { value: u64, bytes: usize } {
     if (buf.len == 0) return RecordError.InvalidVarint;
 
-    var result: u64 = 0;
-    var i: usize = 0;
+    // Fast path: single-byte varint (values 0-127, covers ~95% of record type codes)
+    if (buf[0] & 0x80 == 0) {
+        return .{ .value = buf[0], .bytes = 1 };
+    }
+
+    var result: u64 = @as(u64, buf[0] & 0x7F);
+    var i: usize = 1;
 
     // Read up to 8 bytes with 7-bit encoding + continuation bit
     while (i < 8 and i < buf.len) : (i += 1) {

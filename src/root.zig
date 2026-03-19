@@ -17,6 +17,7 @@ pub const planner = @import("planner.zig");
 pub const codegen = @import("codegen.zig");
 pub const executor = @import("executor.zig");
 pub const journal = @import("journal.zig");
+pub const stmt_cache = @import("stmt_cache.zig");
 
 test {
     // Pull in declarations from all sub-modules so `zig build test`

@@ -38,6 +38,9 @@ pub const Cursor = struct {
     stack: [MAX_DEPTH]StackEntry,
     depth: u8,
     valid: bool,
+    // Page cache — avoids re-fetching the same page on every cell/key/next call
+    cached_page_id: u32,
+    cached_page: ?*pager.Page,
 
     const Self = @This();
 
@@ -48,7 +51,31 @@ pub const Cursor = struct {
             .stack = undefined,
             .depth = 0,
             .valid = false,
+            .cached_page_id = std.math.maxInt(u32),
+            .cached_page = null,
         };
+    }
+
+    /// Fetch a page, using cache if it's the same page.
+    fn getCachedPage(self: *Self, page_id: u32) CursorError!*pager.Page {
+        if (self.cached_page) |p| {
+            if (self.cached_page_id == page_id) return p;
+            // Release old cached page
+            self.bt.pool.releasePage(p);
+        }
+        const page = self.bt.pool.fetchPage(page_id) catch return CursorError.PagerError;
+        self.cached_page = page;
+        self.cached_page_id = page_id;
+        return page;
+    }
+
+    /// Release the cached page (call when cursor is invalidated or destroyed).
+    pub fn releaseCachedPage(self: *Self) void {
+        if (self.cached_page) |p| {
+            self.bt.pool.releasePage(p);
+            self.cached_page = null;
+            self.cached_page_id = std.math.maxInt(u32);
+        }
     }
 
     /// Move to the first (leftmost) entry in the B-tree.
@@ -59,11 +86,10 @@ pub const Cursor = struct {
         var page_id = self.bt.root_page_id;
 
         while (true) {
-            const page = self.bt.pool.fetchPage(page_id) catch return CursorError.PagerError;
+            const page = try self.getCachedPage(page_id);
             const bp = btree.BtreePage{ .page = page, .page_size = self.bt.page_size, .pool = null };
 
             if (bp.cellCount() == 0) {
-                self.bt.pool.releasePage(page);
                 return; // Empty tree
             }
 
@@ -75,16 +101,12 @@ pub const Cursor = struct {
             if (bp.isLeaf()) {
                 self.depth += 1;
                 self.valid = true;
-                self.bt.pool.releasePage(page);
                 return;
             }
 
             // Interior node: descend into leftmost child
-            // For table interior: cell format is u32 left_child + varint rowid
-            // The leftmost child is the left_child of cell 0
             const cell_offset = bp.cellPointer(0);
             const child_page_id = std.mem.readInt(u32, page.data[cell_offset..][0..4], .big);
-            self.bt.pool.releasePage(page);
 
             self.depth += 1;
             page_id = child_page_id;
@@ -99,11 +121,10 @@ pub const Cursor = struct {
         var page_id = self.bt.root_page_id;
 
         while (true) {
-            const page = self.bt.pool.fetchPage(page_id) catch return CursorError.PagerError;
+            const page = try self.getCachedPage(page_id);
             const bp = btree.BtreePage{ .page = page, .page_size = self.bt.page_size, .pool = null };
 
             if (bp.cellCount() == 0) {
-                self.bt.pool.releasePage(page);
                 return;
             }
 
@@ -114,7 +135,6 @@ pub const Cursor = struct {
                 };
                 self.depth += 1;
                 self.valid = true;
-                self.bt.pool.releasePage(page);
                 return;
             }
 
@@ -124,7 +144,6 @@ pub const Cursor = struct {
                 .cell_index = bp.cellCount(), // past last cell = right child
             };
             const child_page_id = bp.rightChild();
-            self.bt.pool.releasePage(page);
 
             self.depth += 1;
             page_id = child_page_id;
@@ -139,11 +158,10 @@ pub const Cursor = struct {
         const leaf = &self.stack[self.depth - 1];
         leaf.cell_index += 1;
 
-        // Check if still on this leaf page
-        const page = self.bt.pool.fetchPage(leaf.page_id) catch return CursorError.PagerError;
+        // Check if still on this leaf page (uses cached page)
+        const page = try self.getCachedPage(leaf.page_id);
         const bp = btree.BtreePage{ .page = page, .page_size = self.bt.page_size, .pool = null };
         const count = bp.cellCount();
-        self.bt.pool.releasePage(page);
 
         if (leaf.cell_index < count) {
             return true; // Still on this leaf
@@ -153,11 +171,13 @@ pub const Cursor = struct {
         // For single-level (leaf-only) trees, we're done
         if (self.depth <= 1) {
             self.valid = false;
+            self.releaseCachedPage();
             return false;
         }
 
         // TODO: multi-level traversal for interior nodes
         self.valid = false;
+        self.releaseCachedPage();
         return false;
     }
 
@@ -175,11 +195,13 @@ pub const Cursor = struct {
         // At start of leaf — need to go up
         if (self.depth <= 1) {
             self.valid = false;
+            self.releaseCachedPage();
             return false;
         }
 
         // TODO: multi-level traversal
         self.valid = false;
+        self.releaseCachedPage();
         return false;
     }
 
@@ -188,8 +210,7 @@ pub const Cursor = struct {
         if (!self.valid) return CursorError.InvalidPosition;
 
         const entry = self.stack[self.depth - 1];
-        const page = self.bt.pool.fetchPage(entry.page_id) catch return CursorError.PagerError;
-        defer self.bt.pool.releasePage(page);
+        const page = try self.getCachedPage(entry.page_id);
 
         const bp = btree.BtreePage{ .page = page, .page_size = self.bt.page_size, .pool = null };
         return bp.readCellKey(bp.cellPointer(entry.cell_index)) catch CursorError.BtreeError;
@@ -200,8 +221,7 @@ pub const Cursor = struct {
         if (!self.valid) return CursorError.InvalidPosition;
 
         const entry = self.stack[self.depth - 1];
-        const page = self.bt.pool.fetchPage(entry.page_id) catch return CursorError.PagerError;
-        defer self.bt.pool.releasePage(page);
+        const page = try self.getCachedPage(entry.page_id);
 
         const bp = btree.BtreePage{ .page = page, .page_size = self.bt.page_size, .pool = null };
         return bp.readTableLeafCell(bp.cellPointer(entry.cell_index)) catch CursorError.BtreeError;
@@ -212,8 +232,7 @@ pub const Cursor = struct {
         self.depth = 0;
         self.valid = false;
 
-        const page = self.bt.pool.fetchPage(self.bt.root_page_id) catch return CursorError.PagerError;
-        defer self.bt.pool.releasePage(page);
+        const page = try self.getCachedPage(self.bt.root_page_id);
 
         const bp = btree.BtreePage{ .page = page, .page_size = self.bt.page_size, .pool = null };
 

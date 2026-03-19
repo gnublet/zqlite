@@ -56,6 +56,66 @@ pub const ExecResult = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Lazy result iterator — zero-allocation per-row access
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A lazy iterator over SELECT results. Yields one row at a time from the
+/// B-tree cursor without materializing all rows. This is the ZQLite equivalent
+/// of SQLite's sqlite3_step() — each call to next() advances the cursor,
+/// evaluates the WHERE clause, and decodes matching rows on the stack.
+pub const ResultIterator = struct {
+    cur: cursor.Cursor,
+    where_expr: ?*ast.Expr,
+    columns: []const schema.Column,
+    num_output_cols: usize,
+    done: bool,
+
+    const Self = @This();
+
+    /// Advance to the next matching row. Returns decoded values in `out_buf`
+    /// (zero heap allocation), or null when exhausted.
+    pub fn next(self: *Self, out_buf: []Value) ?[]Value {
+        while (self.cur.valid) {
+            const entry = self.cur.cell() catch {
+                self.done = true;
+                return null;
+            };
+
+            // Evaluate WHERE clause lazily
+            if (self.where_expr) |w| {
+                const matches = evalWhereLazy(w, self.columns, entry.payload) catch false;
+                if (!matches) {
+                    _ = self.cur.next() catch { self.done = true; return null; };
+                    continue;
+                }
+            }
+
+            // Decode matching row into caller's stack buffer
+            var decode_buf: [64]record.Value = undefined;
+            const decoded = record.deserializeRecordBuf(entry.payload, &decode_buf) catch {
+                _ = self.cur.next() catch {};
+                continue;
+            };
+
+            const n = @min(self.num_output_cols, out_buf.len);
+            for (0..n) |i| {
+                out_buf[i] = if (i < decoded.len) recordToValue(decoded[i]) else .{ .null_val = {} };
+            }
+
+            _ = self.cur.next() catch { self.done = true; };
+            return out_buf[0..n];
+        }
+        self.done = true;
+        return null;
+    }
+
+    /// Release cursor resources.
+    pub fn deinit(self: *Self) void {
+        self.cur.releaseCachedPage();
+        self.done = true;
+    }
+};
+// ═══════════════════════════════════════════════════════════════════════════
 // Executor
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -373,8 +433,13 @@ pub const Executor = struct {
             }
         }
 
-        // Scan rows
-        var rows_list: std.ArrayList(ResultRow) = .{};
+        // Scan rows — pre-allocate flat values buffer (one alloc for ALL rows)
+        const num_output_cols = if (is_star) table_entry.columns.len else col_indices.items.len;
+        const pre_alloc_rows: usize = 256;
+        var vals_pool = arena.alloc(Value, pre_alloc_rows * num_output_cols) catch
+            return ExecError.StorageError;
+        var rows_buf: [pre_alloc_rows]ResultRow = undefined;
+        var row_count: usize = 0;
 
         while (cur.valid) {
             const entry = cur.cell() catch return ExecError.StorageError;
@@ -388,43 +453,95 @@ pub const Executor = struct {
                 }
             }
 
-            // Deserialize into stack buffer (zero allocation)
-            var decode_buf: [64]record.Value = undefined;
-            const decoded = record.deserializeRecordBuf(entry.payload, &decode_buf) catch
-                return ExecError.SerializationFailed;
+            // Get value slice from pre-allocated pool (or re-alloc if overflow)
+            if (row_count >= pre_alloc_rows) {
+                // Fallback: grow with arena alloc for overflow rows
+                const extra = arena.alloc(Value, num_output_cols) catch return ExecError.StorageError;
+                var rows_list: std.ArrayList(ResultRow) = .{};
+                rows_list.appendSlice(arena, rows_buf[0..row_count]) catch return ExecError.StorageError;
+
+                if (is_star) {
+                    var decode_buf: [64]record.Value = undefined;
+                    const decoded = record.deserializeRecordBuf(entry.payload, &decode_buf) catch
+                        return ExecError.SerializationFailed;
+                    for (0..num_output_cols) |ci| {
+                        extra[ci] = if (ci < decoded.len) recordToValue(decoded[ci]) else .{ .null_val = {} };
+                    }
+                } else {
+                    for (col_indices.items, 0..) |maybe_idx, ci| {
+                        if (maybe_idx) |idx| {
+                            const rv = record.readColumn(entry.payload, idx) catch record.Value{ .null_val = {} };
+                            extra[ci] = recordToValue(rv);
+                        } else {
+                            extra[ci] = .{ .null_val = {} };
+                        }
+                    }
+                }
+                rows_list.append(arena, .{ .values = extra }) catch return ExecError.StorageError;
+
+                _ = cur.next() catch return ExecError.StorageError;
+
+                // Drain remaining with ArrayList
+                while (cur.valid) {
+                    const e2 = cur.cell() catch return ExecError.StorageError;
+                    if (sel.where) |where_expr| {
+                        const m2 = evalWhereLazy(where_expr, table_entry.columns, e2.payload) catch false;
+                        if (!m2) { _ = cur.next() catch return ExecError.StorageError; continue; }
+                    }
+                    const extra2 = arena.alloc(Value, num_output_cols) catch return ExecError.StorageError;
+                    if (is_star) {
+                        var decode_buf2: [64]record.Value = undefined;
+                        const decoded2 = record.deserializeRecordBuf(e2.payload, &decode_buf2) catch return ExecError.SerializationFailed;
+                        for (0..num_output_cols) |ci| { extra2[ci] = if (ci < decoded2.len) recordToValue(decoded2[ci]) else .{ .null_val = {} }; }
+                    } else {
+                        for (col_indices.items, 0..) |maybe_idx, ci| {
+                            if (maybe_idx) |idx| { extra2[ci] = recordToValue(record.readColumn(e2.payload, idx) catch record.Value{ .null_val = {} }); } else { extra2[ci] = .{ .null_val = {} }; }
+                        }
+                    }
+                    rows_list.append(arena, .{ .values = extra2 }) catch return ExecError.StorageError;
+                    _ = cur.next() catch return ExecError.StorageError;
+                }
+
+                return ExecResult{
+                    .rows = rows_list.items,
+                    .column_names = col_names_list.items,
+                    .rows_affected = 0,
+                    .message = null,
+                };
+            }
+
+            const vals = vals_pool[row_count * num_output_cols ..][0..num_output_cols];
 
             // Build result row
             if (is_star) {
-                const vals = arena.alloc(Value, table_entry.columns.len) catch return ExecError.StorageError;
-                for (0..table_entry.columns.len) |i| {
-                    if (i < decoded.len) {
-                        vals[i] = recordToValue(decoded[i]);
-                    } else {
-                        vals[i] = .{ .null_val = {} };
-                    }
+                var decode_buf: [64]record.Value = undefined;
+                const decoded = record.deserializeRecordBuf(entry.payload, &decode_buf) catch
+                    return ExecError.SerializationFailed;
+                for (0..num_output_cols) |i| {
+                    vals[i] = if (i < decoded.len) recordToValue(decoded[i]) else .{ .null_val = {} };
                 }
-                rows_list.append(arena, .{ .values = vals }) catch return ExecError.StorageError;
             } else {
-                const vals = arena.alloc(Value, col_indices.items.len) catch return ExecError.StorageError;
                 for (col_indices.items, 0..) |maybe_idx, i| {
                     if (maybe_idx) |idx| {
-                        if (idx < decoded.len) {
-                            vals[i] = recordToValue(decoded[idx]);
-                        } else {
-                            vals[i] = .{ .null_val = {} };
-                        }
+                        const rv = record.readColumn(entry.payload, idx) catch record.Value{ .null_val = {} };
+                        vals[i] = recordToValue(rv);
                     } else {
                         vals[i] = .{ .null_val = {} };
                     }
                 }
-                rows_list.append(arena, .{ .values = vals }) catch return ExecError.StorageError;
             }
+            rows_buf[row_count] = .{ .values = vals };
+            row_count += 1;
 
             _ = cur.next() catch return ExecError.StorageError;
         }
 
+        // Copy stack rows to arena-owned slice for stable return
+        const result_rows = arena.dupe(ResultRow, rows_buf[0..row_count]) catch
+            return ExecError.StorageError;
+
         return ExecResult{
-            .rows = rows_list.items,
+            .rows = result_rows,
             .column_names = col_names_list.items,
             .rows_affected = 0,
             .message = null,

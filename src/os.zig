@@ -81,6 +81,16 @@ pub fn doPwrite(fd: posix.fd_t, buf: []const u8, offset: u64) OsError!usize {
     return @intCast(rc);
 }
 
+/// Scatter-gather write: write multiple buffers to a single offset via pwritev.
+pub fn doPwritev(fd: posix.fd_t, bufs: []const std.posix.iovec_const, offset: u64) OsError!usize {
+    const IOV = extern struct { base: [*]const u8, len: usize };
+    // pwritev takes same layout as iovec_const
+    const iovs: [*]const IOV = @ptrCast(bufs.ptr);
+    const rc = c.pwritev(fd, @ptrCast(iovs), @intCast(bufs.len), @intCast(offset));
+    if (rc < 0) return OsError.WriteFailed;
+    return @intCast(rc);
+}
+
 pub fn doFtruncate(fd: posix.fd_t, length: u64) OsError!void {
     const rc = c.ftruncate(fd, @intCast(length));
     if (rc < 0) return OsError.TruncateFailed;

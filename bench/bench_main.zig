@@ -328,15 +328,16 @@ fn benchScanFilterZqlite(allocator: std.mem.Allocator, iterations: u32) f64 {
         _ = zqliteExecSql(&exec, allocator, sql) catch break;
     }
 
-    // Time the scans — use FixedBufferAllocator to avoid mmap/munmap per query
+    // Time the scans — use StmtCache to avoid re-parsing the same SQL
+    var cache = zqlite.stmt_cache.StmtCache.init(allocator, 16);
+    defer cache.deinit();
     var fba_buf: [65536]u8 = undefined;
     const timer = Timer.start();
     var i: u32 = 0;
     while (i < iterations) : (i += 1) {
         var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
         const fba_alloc = fba.allocator();
-        var parser = zqlite.parser.Parser.init("SELECT * FROM t WHERE value > 300;", fba_alloc);
-        const stmt = parser.parseStatement() catch continue;
+        const stmt = cache.getOrParse("SELECT * FROM t WHERE value > 300;") orelse continue;
         _ = exec.execute(stmt, fba_alloc) catch continue;
     }
     return timer.elapsedMs();

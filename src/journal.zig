@@ -147,14 +147,15 @@ pub const Journal = struct {
         const record_offset: u64 = JOURNAL_HEADER_SIZE +
             @as(u64, self.page_count) * (@as(u64, PAGE_RECORD_HEADER) + @as(u64, self.page_size));
 
-        // Write page_id
+        // Build combined write via scatter-gather (single syscall)
         var id_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &id_buf, page_id, .little);
-        _ = os.doPwrite(fd, &id_buf, record_offset) catch return JournalError.JournalWriteFailed;
 
-        // Write page data
-        _ = os.doPwrite(fd, original_data, record_offset + PAGE_RECORD_HEADER) catch
-            return JournalError.JournalWriteFailed;
+        const iovecs = [_]std.posix.iovec_const{
+            .{ .base = &id_buf, .len = 4 },
+            .{ .base = original_data.ptr, .len = original_data.len },
+        };
+        _ = os.doPwritev(fd, &iovecs, record_offset) catch return JournalError.JournalWriteFailed;
 
         self.page_count += 1;
         self.journaled_pages.put(page_id, {}) catch return JournalError.JournalWriteFailed;
