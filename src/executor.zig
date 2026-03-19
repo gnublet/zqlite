@@ -2,6 +2,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const btree = @import("btree.zig");
 const cursor = @import("cursor.zig");
+const journal_mod = @import("journal.zig");
 const pager = @import("pager.zig");
 const record = @import("record.zig");
 const schema = @import("schema.zig");
@@ -63,6 +64,8 @@ pub const Executor = struct {
     schema_store: *schema.Schema,
     allocator: std.mem.Allocator,
     next_page: u32,
+    journal: ?*journal_mod.Journal,
+    in_transaction: bool,
 
     const Self = @This();
 
@@ -71,12 +74,67 @@ pub const Executor = struct {
             .pool = pool,
             .schema_store = schema_store,
             .allocator = allocator,
-            .next_page = 1, // page 0 is reserved
+            .next_page = 1,
+            .journal = null,
+            .in_transaction = false,
         };
     }
 
-    /// Execute a parsed statement.
+    /// Attach a journal for ACID transactions.
+    pub fn setJournal(self: *Self, j: ?*journal_mod.Journal) void {
+        self.journal = j;
+    }
+
+    /// Execute a parsed statement with auto-commit if not in explicit transaction.
     pub fn execute(self: *Self, stmt: ast.Statement, arena: std.mem.Allocator) ExecError!ExecResult {
+        // Handle transaction control statements
+        switch (stmt) {
+            .begin => return self.execBegin(),
+            .commit => return self.execCommit(),
+            .rollback => return self.execRollback(),
+            else => {},
+        }
+
+        // Check if this is a mutating statement that needs auto-commit
+        const is_mutating = switch (stmt) {
+            .create_table, .drop_table, .insert, .delete, .update => true,
+            else => false,
+        };
+
+        // Auto-commit: wrap mutating statements in begin/commit if not in explicit transaction
+        const needs_auto_commit = is_mutating and !self.in_transaction and self.journal != null;
+
+        if (needs_auto_commit) {
+            if (self.journal) |j| {
+                j.begin() catch return ExecError.StorageError;
+            }
+        }
+
+        const result = self.executeInner(stmt, arena);
+
+        if (needs_auto_commit) {
+            if (result) |_| {
+                // Success: flush dirty pages and commit
+                if (self.journal) |j| {
+                    self.pool.flushAll() catch {
+                        j.rollback() catch {};
+                        return ExecError.StorageError;
+                    };
+                    j.commit() catch return ExecError.StorageError;
+                }
+            } else |_| {
+                // Error: rollback
+                if (self.journal) |j| {
+                    j.rollback() catch {};
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /// Execute a statement (inner, no auto-commit wrapping).
+    fn executeInner(self: *Self, stmt: ast.Statement, arena: std.mem.Allocator) ExecError!ExecResult {
         return switch (stmt) {
             .create_table => |ct| self.execCreateTable(ct, arena),
             .drop_table => |dt| self.execDropTable(dt, arena),
@@ -86,6 +144,38 @@ pub const Executor = struct {
             .update => |upd| self.execUpdate(upd, arena),
             else => ExecError.UnsupportedStatement,
         };
+    }
+
+    fn execBegin(self: *Self) ExecError!ExecResult {
+        if (self.in_transaction) return ExecError.StorageError;
+        if (self.journal) |j| {
+            j.begin() catch return ExecError.StorageError;
+        }
+        self.in_transaction = true;
+        return ExecResult{ .rows = &.{}, .column_names = &.{}, .rows_affected = 0, .message = "Transaction started" };
+    }
+
+    fn execCommit(self: *Self) ExecError!ExecResult {
+        if (!self.in_transaction) return ExecError.StorageError;
+        if (self.journal) |j| {
+            self.pool.flushAll() catch {
+                j.rollback() catch {};
+                self.in_transaction = false;
+                return ExecError.StorageError;
+            };
+            j.commit() catch return ExecError.StorageError;
+        }
+        self.in_transaction = false;
+        return ExecResult{ .rows = &.{}, .column_names = &.{}, .rows_affected = 0, .message = "Transaction committed" };
+    }
+
+    fn execRollback(self: *Self) ExecError!ExecResult {
+        if (!self.in_transaction) return ExecError.StorageError;
+        if (self.journal) |j| {
+            j.rollback() catch {};
+        }
+        self.in_transaction = false;
+        return ExecResult{ .rows = &.{}, .column_names = &.{}, .rows_affected = 0, .message = "Transaction rolled back" };
     }
 
     // ─── CREATE TABLE ────────────────────────────────────────────────
@@ -289,18 +379,19 @@ pub const Executor = struct {
         while (cur.valid) {
             const entry = cur.cell() catch return ExecError.StorageError;
 
-            // Deserialize the record
-            const decoded = record.deserializeRecord(entry.payload, arena) catch
-                return ExecError.SerializationFailed;
-
-            // Evaluate WHERE clause
+            // Evaluate WHERE clause using lazy column access (no full deserialization)
             if (sel.where) |where_expr| {
-                const matches = evalWhere(where_expr, table_entry.columns, decoded) catch false;
+                const matches = evalWhereLazy(where_expr, table_entry.columns, entry.payload) catch false;
                 if (!matches) {
                     _ = cur.next() catch return ExecError.StorageError;
                     continue;
                 }
             }
+
+            // Deserialize into stack buffer (zero allocation)
+            var decode_buf: [64]record.Value = undefined;
+            const decoded = record.deserializeRecordBuf(entry.payload, &decode_buf) catch
+                return ExecError.SerializationFailed;
 
             // Build result row
             if (is_star) {
@@ -440,10 +531,8 @@ pub const Executor = struct {
 
             if (del.where) |where_expr| {
                 const entry = cur.cell() catch return ExecError.StorageError;
-                const decoded = record.deserializeRecord(entry.payload, arena) catch
-                    return ExecError.SerializationFailed;
 
-                const matches = evalWhere(where_expr, table_entry.columns, decoded) catch false;
+                const matches = evalWhereLazy(where_expr, table_entry.columns, entry.payload) catch false;
                 if (matches) {
                     to_delete.append(arena, k) catch return ExecError.StorageError;
                 }
@@ -511,15 +600,15 @@ pub const Executor = struct {
         while (cur.valid) {
             const k = cur.key() catch return ExecError.StorageError;
             const entry = cur.cell() catch return ExecError.StorageError;
-            const decoded = record.deserializeRecord(entry.payload, arena) catch
-                return ExecError.SerializationFailed;
 
             var should_update = true;
             if (upd.where) |where_expr| {
-                should_update = evalWhere(where_expr, table_entry.columns, decoded) catch false;
+                should_update = evalWhereLazy(where_expr, table_entry.columns, entry.payload) catch false;
             }
 
             if (should_update) {
+                const decoded = record.deserializeRecord(entry.payload, arena) catch
+                    return ExecError.SerializationFailed;
                 const new_rec = applyAssignments(decoded, upd.assignments, table_entry.columns, arena) catch
                     return ExecError.TypeError;
                 var buf: [4096]u8 = undefined;
@@ -748,6 +837,97 @@ fn evalWhere(expr: *ast.Expr, columns: []const schema.Column, row: []const recor
             return error.TypeError;
         },
         .paren => |inner| return evalWhere(inner, columns, row),
+        else => return error.TypeError,
+    }
+}
+
+/// Lazy WHERE evaluation: uses record.readColumn() to only decode referenced columns.
+/// No allocation needed — zero-copy from the raw record buffer.
+fn evalWhereLazy(expr: *ast.Expr, columns: []const schema.Column, payload: []const u8) !bool {
+    switch (expr.*) {
+        .binary_op => |op| {
+            switch (op.op) {
+                .eq => {
+                    const left = try resolveValueLazy(op.left, columns, payload);
+                    const right = try resolveValueLazy(op.right, columns, payload);
+                    return valuesEqual(left, right);
+                },
+                .ne => {
+                    const left = try resolveValueLazy(op.left, columns, payload);
+                    const right = try resolveValueLazy(op.right, columns, payload);
+                    return !valuesEqual(left, right);
+                },
+                .lt => {
+                    const left = try resolveValueLazy(op.left, columns, payload);
+                    const right = try resolveValueLazy(op.right, columns, payload);
+                    return valueLess(left, right);
+                },
+                .gt => {
+                    const left = try resolveValueLazy(op.left, columns, payload);
+                    const right = try resolveValueLazy(op.right, columns, payload);
+                    return valueLess(right, left);
+                },
+                .le => {
+                    const left = try resolveValueLazy(op.left, columns, payload);
+                    const right = try resolveValueLazy(op.right, columns, payload);
+                    return valuesEqual(left, right) or valueLess(left, right);
+                },
+                .ge => {
+                    const left = try resolveValueLazy(op.left, columns, payload);
+                    const right = try resolveValueLazy(op.right, columns, payload);
+                    return valuesEqual(left, right) or valueLess(right, left);
+                },
+                .@"and" => {
+                    const left = try evalWhereLazy(op.left, columns, payload);
+                    if (!left) return false; // short-circuit
+                    return try evalWhereLazy(op.right, columns, payload);
+                },
+                .@"or" => {
+                    const left = try evalWhereLazy(op.left, columns, payload);
+                    if (left) return true; // short-circuit
+                    return try evalWhereLazy(op.right, columns, payload);
+                },
+                else => return error.TypeError,
+            }
+        },
+        .unary_op => |op| {
+            if (op.op == .not) {
+                return !(try evalWhereLazy(op.operand, columns, payload));
+            }
+            return error.TypeError;
+        },
+        .paren => |inner| return evalWhereLazy(inner, columns, payload),
+        else => return error.TypeError,
+    }
+}
+
+/// Resolve a value from an expression using lazy column access (readColumn).
+fn resolveValueLazy(expr: *ast.Expr, columns: []const schema.Column, payload: []const u8) !record.Value {
+    switch (expr.*) {
+        .integer_literal => |v| return .{ .integer = v },
+        .real_literal => |v| return .{ .real = v },
+        .string_literal => |v| return .{ .text = v },
+        .null_literal => return .{ .null_val = {} },
+        .column_ref => |ref| {
+            for (columns, 0..) |col, i| {
+                if (std.mem.eql(u8, col.name, ref.column)) {
+                    return record.readColumn(payload, i) catch return record.Value{ .null_val = {} };
+                }
+            }
+            return error.TypeError;
+        },
+        .unary_op => |op| {
+            if (op.op == .negate) {
+                const inner = try resolveValueLazy(op.operand, columns, payload);
+                return switch (inner) {
+                    .integer => |v| record.Value{ .integer = -v },
+                    .real => |v| record.Value{ .real = -v },
+                    else => error.TypeError,
+                };
+            }
+            return error.TypeError;
+        },
+        .paren => |inner| return resolveValueLazy(inner, columns, payload),
         else => return error.TypeError,
     }
 }

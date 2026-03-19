@@ -263,6 +263,54 @@ pub fn serializeRecord(values: []const Value, buf: []u8) RecordError!usize {
 
     return total_size;
 }
+/// Deserialize a record into a caller-provided buffer (zero-allocation).
+/// Returns the slice of values written.
+pub fn deserializeRecordBuf(buf: []const u8, out: []Value) RecordError![]Value {
+    const header_info = getVarint(buf) catch return RecordError.CorruptRecord;
+    const header_len = header_info.value;
+    if (header_len > buf.len) return RecordError.CorruptRecord;
+
+    var num_cols: usize = 0;
+    var hdr_pos: usize = header_info.bytes;
+    var body_pos: usize = @intCast(header_len);
+
+    while (hdr_pos < header_len) {
+        if (num_cols >= out.len) return RecordError.TooManyColumns;
+        const tc_info = getVarint(buf[hdr_pos..]) catch return RecordError.CorruptRecord;
+        const st = tc_info.value;
+        const len = serialTypeLen(st);
+
+        if (body_pos + len > buf.len) return RecordError.CorruptRecord;
+
+        out[num_cols] = switch (st) {
+            0 => .{ .null_val = {} },
+            1, 2, 3, 4, 5, 6 => .{ .integer = readIntBigEndian(buf[body_pos .. body_pos + len], len) },
+            7 => blk: {
+                const bits = std.mem.readInt(u64, buf[body_pos..][0..8], .big);
+                break :blk .{ .real = @bitCast(bits) };
+            },
+            8 => .{ .integer = 0 },
+            9 => .{ .integer = 1 },
+            else => blk: {
+                if (st >= 12) {
+                    const content = buf[body_pos .. body_pos + len];
+                    if (st % 2 == 0) {
+                        break :blk .{ .blob = content };
+                    } else {
+                        break :blk .{ .text = content };
+                    }
+                }
+                break :blk .{ .null_val = {} };
+            },
+        };
+
+        body_pos += len;
+        hdr_pos += tc_info.bytes;
+        num_cols += 1;
+    }
+
+    return out[0..num_cols];
+}
 
 /// Deserialize a record, returning all column values.
 pub fn deserializeRecord(buf: []const u8, allocator: std.mem.Allocator) RecordError![]Value {

@@ -25,8 +25,15 @@ pub fn main() void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Parse CLI args for database path
+    var args = std.process.args();
+    _ = args.next(); // skip argv[0]
+    const db_path_arg = args.next() orelse "/tmp/zqlite.db";
+    const in_memory = std.mem.eql(u8, db_path_arg, ":memory:");
+
+    const db_path: []const u8 = if (in_memory) "/tmp/zqlite_memory.db" else db_path_arg;
+
     // Open the database file
-    const db_path = "/tmp/zqlite.db";
     var fh = zqlite.os.FileHandle.open(db_path, zqlite.os.DEFAULT_PAGE_SIZE, false) catch {
         print("Error: could not open database at {s}\n", .{db_path});
         return;
@@ -40,6 +47,23 @@ pub fn main() void {
     };
     defer pool.deinit();
 
+    // Set up journal for ACID compliance (unless in-memory mode)
+    var journal: zqlite.journal.Journal = undefined;
+    if (!in_memory) {
+        journal = zqlite.journal.Journal.init(allocator, db_path, fh.page_size, &fh);
+
+        // Hot journal recovery (crash recovery)
+        const recovered = journal.hotJournalRecovery() catch false;
+        if (recovered) {
+            print("Recovered from interrupted transaction (hot journal replayed).\n", .{});
+        }
+
+        pool.setJournal(&journal);
+    }
+    defer {
+        if (!in_memory) journal.deinit();
+    }
+
     var schema_store = zqlite.schema.Schema.init(allocator);
     defer schema_store.deinit();
 
@@ -49,6 +73,13 @@ pub fn main() void {
     defer exec_arena.deinit();
 
     var exec = zqlite.executor.Executor.init(exec_arena.allocator(), &pool, &schema_store);
+    if (!in_memory) {
+        exec.setJournal(&journal);
+    }
+
+    if (in_memory) {
+        print("Running in memory mode (no ACID guarantees).\n\n", .{});
+    }
 
     var line_buf: [4096]u8 = undefined;
 

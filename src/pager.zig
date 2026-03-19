@@ -1,5 +1,6 @@
 const std = @import("std");
 const os = @import("os.zig");
+const journal_mod = @import("journal.zig");
 
 /// Pager / Buffer Pool — manages in-memory page cache with clock-sweep eviction.
 ///
@@ -61,6 +62,7 @@ pub const BufferPool = struct {
     clock_hand: u32,
     file: *os.FileHandle,
     allocator: std.mem.Allocator,
+    journal: ?*journal_mod.Journal,
 
     const Self = @This();
 
@@ -96,7 +98,26 @@ pub const BufferPool = struct {
             .clock_hand = 0,
             .file = file,
             .allocator = allocator,
+            .journal = null,
         };
+    }
+
+    /// Attach or detach a journal for ACID transactions.
+    pub fn setJournal(self: *Self, j: ?*journal_mod.Journal) void {
+        self.journal = j;
+    }
+
+    /// Mark a page as dirty, journaling the original content first if needed.
+    pub fn markPageDirty(self: *Self, page: *Page) void {
+        if (!page.dirty) {
+            // Journal the original content before first modification
+            if (self.journal) |j| {
+                if (j.active) {
+                    j.journalPage(page.page_id, page.data) catch {};
+                }
+            }
+        }
+        page.dirty = true;
     }
 
     /// Release all resources.

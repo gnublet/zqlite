@@ -9,7 +9,7 @@ const c = @cImport({
 ///
 /// CAVEATS (printed in output):
 ///  - ZQLite re-parses each SQL string (no prepared statements yet)
-///  - ZQLite has no WAL, journaling, or crash-safety overhead
+///  - ZQLite uses rollback journal (fsync + journal on each auto-commit)
 ///  - ZQLite uses a single B-tree leaf page (no page splitting)
 ///  - SQLite uses prepared statements with bind for insert/lookup
 ///    (the idiomatic, optimized path)
@@ -122,8 +122,18 @@ fn benchBulkInsertZqlite(allocator: std.mem.Allocator, count: u32) f64 {
 
     var exec = zqlite.executor.Executor.init(exec_arena.allocator(), &pool, &schema_store);
 
+    // Set up journal for ACID mode
+    var journal = zqlite.journal.Journal.init(allocator, tmp_path, fh.page_size, &fh);
+    defer journal.deinit();
+    defer zqlite.os.deleteFile(tmp_path ++ "-journal");
+    pool.setJournal(&journal);
+    exec.setJournal(&journal);
+
     // CREATE TABLE via SQL
     _ = zqliteExecSql(&exec, allocator, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value INTEGER);") catch return -1;
+
+    // Wrap inserts in a single transaction (matching SQLite's BEGIN/COMMIT)
+    _ = zqliteExecSql(&exec, allocator, "BEGIN;") catch return -1;
 
     // Time the inserts — use FixedBufferAllocator to avoid mmap/munmap per query
     var fba_buf: [65536]u8 = undefined;
@@ -138,6 +148,8 @@ fn benchBulkInsertZqlite(allocator: std.mem.Allocator, count: u32) f64 {
         const stmt = parser.parseStatement() catch continue;
         _ = exec.execute(stmt, fba_alloc) catch break;
     }
+
+    _ = zqliteExecSql(&exec, allocator, "COMMIT;") catch return -1;
 
     return timer.elapsedMs();
 }
@@ -198,6 +210,13 @@ fn benchPointLookupZqlite(allocator: std.mem.Allocator, count: u32) f64 {
     defer exec_arena.deinit();
 
     var exec = zqlite.executor.Executor.init(exec_arena.allocator(), &pool, &schema_store);
+
+    // Set up journal for ACID mode
+    var journal = zqlite.journal.Journal.init(allocator, tmp_path, fh.page_size, &fh);
+    defer journal.deinit();
+    defer zqlite.os.deleteFile(tmp_path ++ "-journal");
+    pool.setJournal(&journal);
+    exec.setJournal(&journal);
 
     // Create and populate table via SQL
     _ = zqliteExecSql(&exec, allocator, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);") catch return -1;
@@ -292,6 +311,13 @@ fn benchScanFilterZqlite(allocator: std.mem.Allocator, iterations: u32) f64 {
 
     var exec = zqlite.executor.Executor.init(exec_arena.allocator(), &pool, &schema_store);
 
+    // Set up journal for ACID mode
+    var journal = zqlite.journal.Journal.init(allocator, tmp_path, fh.page_size, &fh);
+    defer journal.deinit();
+    defer zqlite.os.deleteFile(tmp_path ++ "-journal");
+    pool.setJournal(&journal);
+    exec.setJournal(&journal);
+
     // Create and populate table
     _ = zqliteExecSql(&exec, allocator, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value INTEGER);") catch return -1;
 
@@ -377,6 +403,13 @@ fn benchPointDeleteZqlite(allocator: std.mem.Allocator, count: u32) f64 {
     defer exec_arena.deinit();
 
     var exec = zqlite.executor.Executor.init(exec_arena.allocator(), &pool, &schema_store);
+
+    // Set up journal for ACID mode
+    var journal = zqlite.journal.Journal.init(allocator, tmp_path, fh.page_size, &fh);
+    defer journal.deinit();
+    defer zqlite.os.deleteFile(tmp_path ++ "-journal");
+    pool.setJournal(&journal);
+    exec.setJournal(&journal);
 
     _ = zqliteExecSql(&exec, allocator, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);") catch return -1;
 
@@ -465,6 +498,13 @@ fn benchMixedWorkloadZqlite(allocator: std.mem.Allocator, count: u32) f64 {
     defer exec_arena.deinit();
 
     var exec = zqlite.executor.Executor.init(exec_arena.allocator(), &pool, &schema_store);
+
+    // Set up journal for ACID mode
+    var journal = zqlite.journal.Journal.init(allocator, tmp_path, fh.page_size, &fh);
+    defer journal.deinit();
+    defer zqlite.os.deleteFile(tmp_path ++ "-journal");
+    pool.setJournal(&journal);
+    exec.setJournal(&journal);
 
     _ = zqliteExecSql(&exec, allocator, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);") catch return -1;
 
@@ -570,6 +610,13 @@ fn benchPointUpdateZqlite(allocator: std.mem.Allocator, count: u32) f64 {
     defer exec_arena.deinit();
 
     var exec = zqlite.executor.Executor.init(exec_arena.allocator(), &pool, &schema_store);
+
+    // Set up journal for ACID mode
+    var journal = zqlite.journal.Journal.init(allocator, tmp_path, fh.page_size, &fh);
+    defer journal.deinit();
+    defer zqlite.os.deleteFile(tmp_path ++ "-journal");
+    pool.setJournal(&journal);
+    exec.setJournal(&journal);
 
     _ = zqliteExecSql(&exec, allocator, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, value INTEGER);") catch return -1;
 
@@ -733,10 +780,11 @@ pub fn main() void {
 
     print("\nNotes:\n", .{});
     print("  * Both engines use the full SQL pipeline (parse → plan → execute → storage)\n", .{});
-    print("  * ZQLite advantages: zero-copy allocator, PK fast-path (bt.search/bt.delete)\n", .{});
+    print("  * ZQLite runs in ACID mode (rollback journal + fsync on each auto-commit)\n", .{});
+    print("  * SQLite uses auto-commit per statement (rollback journal + fsync)\n", .{});
+    print("  * ZQLite advantages: zero-copy allocator, PK fast-path (bt.search)\n", .{});
     print("  * SQLite advantages: prepared statements, decades of optimization, MVCC\n", .{});
-    print("  * Neither engine uses transactions in these benchmarks\n", .{});
-    print("  * ZQLite does not yet implement: WAL, crash recovery, page splitting,\n", .{});
+    print("  * ZQLite does not yet implement: WAL, page splitting,\n", .{});
     print("    multi-table joins, indexes, or prepared statements\n", .{});
     print("  * Ratio > 1 = ZQLite faster, < 1 = SQLite faster\n", .{});
     print("\nBenchmark complete.\n", .{});

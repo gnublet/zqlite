@@ -69,6 +69,7 @@ pub const Cell = struct {
 pub const BtreePage = struct {
     page: *pager.Page,
     page_size: u32,
+    pool: ?*pager.BufferPool,
 
     const Self = @This();
 
@@ -144,7 +145,7 @@ pub const BtreePage = struct {
         self.page.data[0] = page_type;
         self.setCellCount(0);
         self.setCellContentOffset(@intCast(self.page_size));
-        self.page.markDirty();
+        if (self.pool) |p| p.markPageDirty(self.page) else self.page.markDirty();
     }
 
     /// Read the key (rowid) from a cell at a given offset on a table leaf/interior.
@@ -252,7 +253,7 @@ pub const BtreePage = struct {
         self.setCellPointer(insert_idx, new_content_start);
         self.setCellCount(count + 1);
         self.setCellContentOffset(new_content_start);
-        self.page.markDirty();
+        if (self.pool) |p| p.markPageDirty(self.page) else self.page.markDirty();
     }
 
     /// Search for a rowid on a table leaf page. Returns the cell index if found.
@@ -301,7 +302,7 @@ pub const Btree = struct {
     pub fn create(pool: *pager.BufferPool, page_type: u8) BtreeError!Self {
         const root = pool.allocatePage() catch return BtreeError.PagerError;
         const root_id = root.page_id;
-        var bp = BtreePage{ .page = root, .page_size = pool.page_size };
+        var bp = BtreePage{ .page = root, .page_size = pool.page_size, .pool = pool };
         bp.initPage(page_type);
         pool.releasePage(root);
 
@@ -326,7 +327,7 @@ pub const Btree = struct {
         const page = self.pool.fetchPage(self.root_page_id) catch return BtreeError.PagerError;
         defer self.pool.releasePage(page);
 
-        var bp = BtreePage{ .page = page, .page_size = self.page_size };
+        var bp = BtreePage{ .page = page, .page_size = self.page_size, .pool = self.pool };
 
         // For now, only support single-page leaf (splitting comes later)
         if (bp.isLeaf()) {
@@ -347,7 +348,7 @@ pub const Btree = struct {
         const page = self.pool.fetchPage(self.root_page_id) catch return BtreeError.PagerError;
         defer self.pool.releasePage(page);
 
-        var bp = BtreePage{ .page = page, .page_size = self.page_size };
+        var bp = BtreePage{ .page = page, .page_size = self.page_size, .pool = self.pool };
 
         if (bp.isLeaf()) {
             const idx = try bp.searchTableLeaf(rowid);
@@ -366,7 +367,7 @@ pub const Btree = struct {
         const page = self.pool.fetchPage(self.root_page_id) catch return BtreeError.PagerError;
         defer self.pool.releasePage(page);
 
-        var bp = BtreePage{ .page = page, .page_size = self.page_size };
+        var bp = BtreePage{ .page = page, .page_size = self.page_size, .pool = self.pool };
 
         if (bp.isLeaf()) {
             const idx = try bp.searchTableLeaf(rowid);

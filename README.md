@@ -4,12 +4,15 @@ A high-performance SQLite clone written in [Zig](https://ziglang.org/), targetin
 
 ## Features
 
+- **ACID transactions** with rollback journal, auto-commit, and crash recovery
 - **B-tree storage engine** with leaf/interior node splitting and in-order traversal
 - **Buffer pool / pager** with clock-sweep eviction and dirty-page write-back
-- **Write-ahead log (WAL)** with frame-level checksums and checkpoint support
+- **Rollback journal** — saves original pages before modification, fsync on commit
 - **SQL front-end** — tokenizer → parser → AST → bytecode compiler → register-based VM
+- **Transaction control** — `BEGIN`, `COMMIT`, `ROLLBACK` statements
 - **Query planner** with cost-based scan selection (full scan, index scan, rowid lookup)
 - **Record format** compatible with SQLite's varint-encoded serial types
+- **In-memory mode** — `zqlite :memory:` disables journaling for maximum speed
 - **Direct I/O** with page-aligned buffers and optional `O_DIRECT`
 - **POSIX I/O** via libc (`pread`/`pwrite`/`ftruncate`) — cross-platform
 - **io_uring** integration for async I/O on Linux (optional optimization)
@@ -26,10 +29,16 @@ A high-performance SQLite clone written in [Zig](https://ziglang.org/), targetin
 # Build
 zig build
 
-# Run the CLI
+# Run the CLI (ACID mode, default path /tmp/zqlite.db)
 zig build run
 
-# Run all tests (77 tests)
+# Run with a specific database file
+zig build run -- mydb.db
+
+# Run in memory mode (no journal, no fsync)
+zig build run -- :memory:
+
+# Run all tests (100+ tests)
 zig build test
 
 # Run benchmarks (compare ZQLite vs C SQLite)
