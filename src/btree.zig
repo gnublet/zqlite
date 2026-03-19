@@ -361,6 +361,7 @@ pub const Btree = struct {
 
     /// Delete a rowid from a table B-tree.
     /// Currently only supports single-leaf deletion (no rebalancing).
+    /// Defragments the page after deletion to reclaim cell content space.
     pub fn delete(self: *Self, rowid: i64) BtreeError!bool {
         const page = self.pool.fetchPage(self.root_page_id) catch return BtreeError.PagerError;
         defer self.pool.releasePage(page);
@@ -376,7 +377,48 @@ pub const Btree = struct {
                 while (j < count - 1) : (j += 1) {
                     bp.setCellPointer(j, bp.cellPointer(j + 1));
                 }
-                bp.setCellCount(count - 1);
+                const new_count = count - 1;
+                bp.setCellCount(new_count);
+
+                // Defragment: compact all surviving cells to reclaim freed space.
+                // Two-pass: first read all cell data, then write back compacted.
+                const data = bp.page.data;
+                const psize: usize = @intCast(bp.page_size);
+
+                // Pass 1: collect all cell content into a temp buffer
+                // Cell content can't exceed page size. Cell count can't exceed page_size/4.
+                var tmp_buf: [65536]u8 = undefined; // max page size
+                const tmp = tmp_buf[0..psize];
+                var sizes_buf: [4096]u16 = undefined; // max ~4096 cells
+                var tmp_pos: usize = 0;
+                var cell_count: usize = 0;
+
+                var k: u16 = 0;
+                while (k < new_count) : (k += 1) {
+                    const cell_off: usize = bp.cellPointer(k);
+                    const pinfo = record.getVarint(data[cell_off..]) catch return BtreeError.CorruptPage;
+                    const rinfo = record.getVarint(data[cell_off + pinfo.bytes ..]) catch return BtreeError.CorruptPage;
+                    const payload_size: usize = @intCast(pinfo.value);
+                    const cs: u16 = @intCast(pinfo.bytes + rinfo.bytes + payload_size);
+                    sizes_buf[cell_count] = cs;
+                    @memcpy(tmp[tmp_pos..][0..cs], data[cell_off..][0..cs]);
+                    tmp_pos += cs;
+                    cell_count += 1;
+                }
+
+                // Pass 2: write cells back compacted from end of page
+                var write_pos: u16 = @intCast(bp.page_size);
+                tmp_pos = 0;
+                k = 0;
+                while (k < new_count) : (k += 1) {
+                    const cs = sizes_buf[k];
+                    write_pos -= cs;
+                    @memcpy(data[write_pos..][0..cs], tmp[tmp_pos..][0..cs]);
+                    bp.setCellPointer(k, write_pos);
+                    tmp_pos += cs;
+                }
+                bp.setCellContentOffset(write_pos);
+
                 bp.page.markDirty();
                 return true;
             }
