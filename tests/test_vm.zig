@@ -19,12 +19,11 @@ test "VM: arithmetic operations" {
 
     var vm_inst = try zqlite.vm.VM.init(std.testing.allocator, program);
     defer vm_inst.deinit();
-    try vm_inst.execute();
-
-    const row = vm_inst.results.items[0];
-    try std.testing.expectEqual(@as(i64, 142), row.values[0].integer);
-    try std.testing.expectEqual(@as(i64, 58), row.values[1].integer);
-    try std.testing.expectEqual(@as(i64, 4200), row.values[2].integer);
+    try std.testing.expectEqual(zqlite.vm.StepResult.row, try vm_inst.step());
+    try std.testing.expectEqual(@as(i64, 142), vm_inst.registers[2].integer);
+    try std.testing.expectEqual(@as(i64, 58), vm_inst.registers[3].integer);
+    try std.testing.expectEqual(@as(i64, 4200), vm_inst.registers[4].integer);
+    try std.testing.expectEqual(zqlite.vm.StepResult.done, try vm_inst.step());
 }
 
 test "VM: conditional logic" {
@@ -48,9 +47,9 @@ test "VM: conditional logic" {
 
     var vm_inst = try zqlite.vm.VM.init(std.testing.allocator, program);
     defer vm_inst.deinit();
-    try vm_inst.execute();
-
-    try std.testing.expectEqual(@as(i64, 1), vm_inst.results.items[0].values[0].integer);
+    try std.testing.expectEqual(zqlite.vm.StepResult.row, try vm_inst.step());
+    try std.testing.expectEqual(@as(i64, 1), vm_inst.registers[3].integer);
+    try std.testing.expectEqual(zqlite.vm.StepResult.done, try vm_inst.step());
 }
 
 test "VM: loop producing multiple result rows" {
@@ -75,12 +74,12 @@ test "VM: loop producing multiple result rows" {
 
     var vm_inst = try zqlite.vm.VM.init(std.testing.allocator, program);
     defer vm_inst.deinit();
-    try vm_inst.execute();
-
-    try std.testing.expectEqual(@as(usize, 3), vm_inst.results.items.len);
-    try std.testing.expectEqual(@as(i64, 0), vm_inst.results.items[0].values[0].integer);
-    try std.testing.expectEqual(@as(i64, 1), vm_inst.results.items[1].values[0].integer);
-    try std.testing.expectEqual(@as(i64, 2), vm_inst.results.items[2].values[0].integer);
+    var rows: i64 = 0;
+    while (try vm_inst.step() == .row) {
+        try std.testing.expectEqual(rows, vm_inst.registers[0].integer);
+        rows += 1;
+    }
+    try std.testing.expectEqual(@as(i64, 3), rows);
 }
 
 test "VM: null handling" {
@@ -99,8 +98,7 @@ test "VM: null handling" {
 
     var vm_inst = try zqlite.vm.VM.init(std.testing.allocator, program);
     defer vm_inst.deinit();
-    try vm_inst.execute();
-
-    // null + integer = null
-    try std.testing.expect(vm_inst.results.items[0].values[0] == .null_val);
+    try std.testing.expectEqual(zqlite.vm.StepResult.row, try vm_inst.step());
+    try std.testing.expect(vm_inst.registers[2] == .null_val);
+    try std.testing.expectEqual(zqlite.vm.StepResult.done, try vm_inst.step());
 }

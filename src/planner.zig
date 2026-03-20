@@ -23,6 +23,7 @@ pub const ScanPlan = struct {
     table_name: []const u8,
     scan_type: ScanType,
     index_name: ?[]const u8,
+    index_key_expr: ?*ast.Expr,
     estimated_rows: u64,
 };
 
@@ -110,23 +111,64 @@ pub const Planner = struct {
         };
     }
 
-    fn planTableScan(self: *Self, table_name: []const u8, where: ?*ast.Expr) ScanPlan {
-        _ = where; // TODO: check if WHERE matches an index prefix
+    pub fn planTableScan(self: *Self, table_name: []const u8, where: ?*ast.Expr) ScanPlan {
+        if (where) |w| {
+            if (w.* == .binary_op and w.binary_op.op == .eq) {
+                var col_name: ?[]const u8 = null;
+                var val_expr: ?*ast.Expr = null;
 
-        // Check if any index exists for this table
-        var index_buf: [16]schema.Index = undefined;
-        const idx_count = self.schema_cache.indexesForTable(table_name, &index_buf);
+                if (w.binary_op.left.* == .column_ref and
+                    (w.binary_op.left.column_ref.table == null or std.mem.eql(u8, w.binary_op.left.column_ref.table.?, table_name)))
+                {
+                    col_name = w.binary_op.left.column_ref.column;
+                    val_expr = w.binary_op.right;
+                } else if (w.binary_op.right.* == .column_ref and
+                           (w.binary_op.right.column_ref.table == null or std.mem.eql(u8, w.binary_op.right.column_ref.table.?, table_name)))
+                {
+                    col_name = w.binary_op.right.column_ref.column;
+                    val_expr = w.binary_op.left;
+                }
 
-        if (idx_count > 0) {
-            // TODO: check if WHERE clause prefix-matches an index
-            // For now, default to full scan
+                if (col_name) |cname| {
+                    if (self.schema_cache.getTable(table_name)) |tbl| {
+                        if (tbl.has_rowid_alias and tbl.rowid_alias_col != null) {
+                            if (std.mem.eql(u8, cname, tbl.columns[tbl.rowid_alias_col.?].name)) {
+                                return .{
+                                    .table_name = table_name,
+                                    .scan_type = .rowid_lookup,
+                                    .index_name = null,
+                                    .index_key_expr = val_expr,
+                                    .estimated_rows = 1,
+                                };
+                            }
+                        }
+                    }
+
+                    var index_buf: [16]schema.Index = undefined;
+                    const idx_count = self.schema_cache.indexesForTable(table_name, &index_buf);
+                    
+                    // Look for an index starting with this column
+                    for (index_buf[0..idx_count]) |idx| {
+                        if (idx.columns.len > 0 and std.mem.eql(u8, idx.columns[0], cname)) {
+                            return .{
+                                .table_name = table_name,
+                                .scan_type = .index_scan,
+                                .index_name = idx.name,
+                                .index_key_expr = val_expr,
+                                .estimated_rows = 1,
+                            };
+                        }
+                    }
+                }
+            }
         }
 
         return .{
             .table_name = table_name,
             .scan_type = .full_scan,
             .index_name = null,
-            .estimated_rows = 1000, // default estimate
+            .index_key_expr = null,
+            .estimated_rows = 1000, // default estimate for full scan
         };
     }
 

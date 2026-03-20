@@ -95,9 +95,9 @@ test "executor+journal: insert beyond page capacity" {
         _ = try exec.execute(stmt, arena.allocator());
     }
 
-    // Insert 200 rows (enough to trigger splits)
+    // Insert 500 rows (enough to trigger splits)
     var i: i64 = 0;
-    while (i < 200) : (i += 1) {
+    while (i < 500) : (i += 1) {
         var buf: [64]u8 = undefined;
         const sql = std.fmt.bufPrint(&buf, "INSERT INTO t VALUES ({}, {});", .{ i, i * 7 }) catch unreachable;
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

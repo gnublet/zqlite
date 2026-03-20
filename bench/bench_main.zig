@@ -135,18 +135,27 @@ fn benchBulkInsertZqlite(allocator: std.mem.Allocator, count: u32) f64 {
     // Wrap inserts in a single transaction (matching SQLite's BEGIN/COMMIT)
     _ = zqliteExecSql(&exec, allocator, "BEGIN;") catch return -1;
 
-    // Time the inserts — use FixedBufferAllocator to avoid mmap/munmap per query
-    var fba_buf: [65536]u8 = undefined;
+    // Pre-parse the statement once for fair comparison (SQLite does this too)
+    var parse_arena = std.heap.ArenaAllocator.init(allocator);
+    defer parse_arena.deinit();
+    var parser = zqlite.parser.Parser.init("INSERT INTO t VALUES (?, ?, ?);", parse_arena.allocator());
+    const stmt = parser.parseStatement() catch return -1;
+
+    // Time the inserts
+    var prepared = exec.prepare(stmt, null) catch return -1;
+    defer prepared.deinit();
+
     const timer = Timer.start();
-    var sql_buf: [256]u8 = undefined;
     var i: u32 = 0;
     while (i < count) : (i += 1) {
-        const sql = std.fmt.bufPrint(&sql_buf, "INSERT INTO t VALUES ({d}, 'benchmark_payload_data', {d});", .{ i, i * 2 }) catch continue;
-        var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
-        const fba_alloc = fba.allocator();
-        var parser = zqlite.parser.Parser.init(sql, fba_alloc);
-        const stmt = parser.parseStatement() catch continue;
-        _ = exec.execute(stmt, fba_alloc) catch break;
+        const params = [_]zqlite.record.Value{
+            .{ .integer = @intCast(i) },
+            .{ .text = "benchmark_payload_data" },
+            .{ .integer = @intCast(i * 2) },
+        };
+        prepared.bindParams(&params);
+        _ = prepared.step() catch continue;
+        prepared.reset();
     }
 
     _ = zqliteExecSql(&exec, allocator, "COMMIT;") catch return -1;
@@ -335,13 +344,15 @@ fn benchScanFilterZqlite(allocator: std.mem.Allocator, iterations: u32) f64 {
     var p = zqlite.parser.Parser.init("SELECT * FROM t WHERE value > 300;", parse_arena.allocator());
     const parsed = p.parseStatement() catch return -1;
 
-    // Time the scans — reuse parsed AST via bytecode VM (VDBE-like)
-    var fba_buf: [65536]u8 = undefined;
+    // Time the scans — reuse prepared VM Statement
+    var prepared = exec.prepare(parsed, null) catch return -1;
+    defer prepared.deinit();
+
     const timer = Timer.start();
     var i: u32 = 0;
     while (i < iterations) : (i += 1) {
-        var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
-        _ = exec.executeViaVM(parsed, null, fba.allocator()) catch continue;
+        prepared.reset();
+        while (prepared.step() catch break) |_| {}
     }
     return timer.elapsedMs();
 }
@@ -376,7 +387,11 @@ fn benchScanFilterSqlite(iterations: u32) f64 {
     const timer = Timer.start();
     var i: u32 = 0;
     while (i < iterations) : (i += 1) {
-        while (c.sqlite3_step(sel_stmt) == c.SQLITE_ROW) {}
+        while (c.sqlite3_step(sel_stmt) == c.SQLITE_ROW) {
+            _ = c.sqlite3_column_int(sel_stmt, 0);
+            _ = c.sqlite3_column_text(sel_stmt, 1);
+            _ = c.sqlite3_column_int(sel_stmt, 2);
+        }
         _ = c.sqlite3_reset(sel_stmt);
     }
     _ = c.sqlite3_finalize(sel_stmt);
@@ -717,6 +732,8 @@ fn benchIndexLookupZqlite(allocator: std.mem.Allocator, count: u32) f64 {
         defer arena_state.deinit();
         var parser = zqlite.parser.Parser.init("INSERT INTO items VALUES (?, ?, ?)", arena_state.allocator());
         const ins_stmt = parser.parseStatement() catch return 0;
+        var prepared_ins = exec.prepare(ins_stmt, null) catch return 0;
+        defer prepared_ins.deinit();
         var i: u32 = 0;
         while (i < 200) : (i += 1) {
             const params = [_]zqlite.record.Value{
@@ -724,7 +741,9 @@ fn benchIndexLookupZqlite(allocator: std.mem.Allocator, count: u32) f64 {
                 .{ .text = "item" },
                 .{ .integer = @intCast(i % 10) },
             };
-            _ = exec.executeWithParams(ins_stmt, &params, arena_state.allocator()) catch continue;
+            prepared_ins.bindParams(&params);
+            _ = prepared_ins.step() catch continue;
+            prepared_ins.reset();
         }
     }
     _ = zqliteExecSql(&exec, allocator, "COMMIT") catch return 0;
@@ -736,16 +755,18 @@ fn benchIndexLookupZqlite(allocator: std.mem.Allocator, count: u32) f64 {
     var sel_parser = zqlite.parser.Parser.init("SELECT * FROM items WHERE category = ?", sel_arena.allocator());
     const sel_stmt = sel_parser.parseStatement() catch return 0;
 
-    // Benchmark: indexed lookups with fast FBA
-    var fba_buf: [65536]u8 = undefined;
+    var prepared_sel = exec.prepare(sel_stmt, null) catch return 0;
+    defer prepared_sel.deinit();
+
     const timer = Timer.start();
     var i: u32 = 0;
     while (i < count) : (i += 1) {
-        var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
         const params = [_]zqlite.record.Value{
             .{ .integer = @intCast(i % 10) },
         };
-        _ = exec.executeWithParams(sel_stmt, &params, fba.allocator()) catch {};
+        prepared_sel.bindParams(&params);
+        while (prepared_sel.step() catch break) |_| {}
+        prepared_sel.reset();
     }
     return timer.elapsedMs();
 }
@@ -770,6 +791,106 @@ fn benchIndexLookupSqlite(count: u32) f64 {
 
     var sel_stmt: ?*c.sqlite3_stmt = null;
     _ = c.sqlite3_prepare_v2(db, "SELECT * FROM items WHERE category = ?", -1, &sel_stmt, null);
+
+    const timer = Timer.start();
+    i = 0;
+    while (i < count) : (i += 1) {
+        _ = c.sqlite3_bind_int64(sel_stmt, 1, @intCast(i % 10));
+        while (c.sqlite3_step(sel_stmt) == c.SQLITE_ROW) {}
+        _ = c.sqlite3_reset(sel_stmt);
+    }
+    _ = c.sqlite3_finalize(sel_stmt);
+    return timer.elapsedMs();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Benchmark 7.5: Index Covering (index fast path)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn benchIndexCoveringZqlite(allocator: std.mem.Allocator, count: u32) f64 {
+    const tmp_path = "/tmp/zqlite_bench_idx_cov.db";
+    defer zqlite.os.deleteFile(tmp_path);
+
+    var fh = zqlite.os.FileHandle.open(tmp_path, zqlite.os.DEFAULT_PAGE_SIZE, false) catch return -1;
+    defer fh.close();
+
+    var pool = zqlite.pager.BufferPool.init(allocator, &fh, 2048) catch return -1;
+    defer pool.deinit();
+
+    var schema_store = zqlite.schema.Schema.init(allocator);
+    defer schema_store.deinit();
+    var exec = zqlite.executor.Executor.init(allocator, &pool, &schema_store);
+    defer exec.deinit();
+    exec.setFile(&fh);
+
+    _ = zqliteExecSql(&exec, allocator, "BEGIN TRANSACTION") catch return 0;
+    _ = zqliteExecSql(&exec, allocator, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, category INTEGER)") catch return 0;
+    {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        var parser = zqlite.parser.Parser.init("INSERT INTO items VALUES (?, ?, ?)", arena_state.allocator());
+        const ins_stmt = parser.parseStatement() catch return 0;
+        var prepared_ins = exec.prepare(ins_stmt, null) catch return 0;
+        defer prepared_ins.deinit();
+        var i: u32 = 0;
+        while (i < 200) : (i += 1) {
+            const params = [_]zqlite.record.Value{
+                .{ .integer = @intCast(i) },
+                .{ .text = "item" },
+                .{ .integer = @intCast(i % 10) },
+            };
+            prepared_ins.bindParams(&params);
+            _ = prepared_ins.step() catch continue;
+            prepared_ins.reset();
+        }
+    }
+    _ = zqliteExecSql(&exec, allocator, "COMMIT") catch return 0;
+    _ = zqliteExecSql(&exec, allocator, "CREATE INDEX idx_category ON items (category)") catch return 0;
+
+    // Pre-parse SELECT with placeholder
+    var sel_arena = std.heap.ArenaAllocator.init(allocator);
+    defer sel_arena.deinit();
+    // CHANGED TO `SELECT category` for covering!
+    var sel_parser = zqlite.parser.Parser.init("SELECT category FROM items WHERE category = ?", sel_arena.allocator());
+    const sel_stmt = sel_parser.parseStatement() catch return 0;
+
+    var prepared_sel = exec.prepare(sel_stmt, null) catch return 0;
+    defer prepared_sel.deinit();
+
+    const timer = Timer.start();
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const params = [_]zqlite.record.Value{
+            .{ .integer = @intCast(i % 10) },
+        };
+        prepared_sel.bindParams(&params);
+        while (prepared_sel.step() catch break) |_| {}
+        prepared_sel.reset();
+    }
+    return timer.elapsedMs();
+}
+
+fn benchIndexCoveringSqlite(count: u32) f64 {
+    var db: ?*c.sqlite3 = null;
+    _ = c.sqlite3_open(":memory:", &db);
+    defer _ = c.sqlite3_close(db);
+
+    _ = c.sqlite3_exec(db, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, category INTEGER)", null, null, null);
+    var ins_stmt: ?*c.sqlite3_stmt = null;
+    _ = c.sqlite3_prepare_v2(db, "INSERT INTO items VALUES (?, ?, ?)", -1, &ins_stmt, null);
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) {
+        _ = c.sqlite3_bind_int64(ins_stmt, 1, @intCast(i));
+        _ = c.sqlite3_bind_int64(ins_stmt, 3, @intCast(i % 10));
+        _ = c.sqlite3_step(ins_stmt);
+        _ = c.sqlite3_reset(ins_stmt);
+    }
+    _ = c.sqlite3_finalize(ins_stmt);
+    _ = c.sqlite3_exec(db, "CREATE INDEX idx_category ON items (category)", null, null, null);
+
+    var sel_stmt: ?*c.sqlite3_stmt = null;
+    // CHANGED TO `SELECT category` for covering!
+    _ = c.sqlite3_prepare_v2(db, "SELECT category FROM items WHERE category = ?", -1, &sel_stmt, null);
 
     const timer = Timer.start();
     i = 0;
@@ -813,12 +934,22 @@ fn benchJoin2TableZqlite(allocator: std.mem.Allocator, count: u32) f64 {
         const ins_u = p1.parseStatement() catch return 0;
         var p2 = zqlite.parser.Parser.init("INSERT INTO orders VALUES (?, ?, ?)", arena_state.allocator());
         const ins_o = p2.parseStatement() catch return 0;
+        var prep_u = exec.prepare(ins_u, null) catch return 0;
+        defer prep_u.deinit();
+        var prep_o = exec.prepare(ins_o, null) catch return 0;
+        defer prep_o.deinit();
+
         var i: u32 = 0;
         while (i < 50) : (i += 1) {
             const u_params = [_]zqlite.record.Value{ .{ .integer = @intCast(i) }, .{ .text = "user" } };
-            _ = exec.executeWithParams(ins_u, &u_params, arena_state.allocator()) catch continue;
+            prep_u.bindParams(&u_params);
+            _ = prep_u.step() catch continue;
+            prep_u.reset();
+
             const o_params = [_]zqlite.record.Value{ .{ .integer = @intCast(i) }, .{ .integer = @intCast(i % 50) }, .{ .integer = @intCast(i * 100) } };
-            _ = exec.executeWithParams(ins_o, &o_params, arena_state.allocator()) catch continue;
+            prep_o.bindParams(&o_params);
+            _ = prep_o.step() catch continue;
+            prep_o.reset();
         }
     }
     _ = zqliteExecSql(&exec, allocator, "COMMIT") catch return 0;
@@ -830,12 +961,14 @@ fn benchJoin2TableZqlite(allocator: std.mem.Allocator, count: u32) f64 {
     const join_stmt = jp.parseStatement() catch return 0;
 
     // Benchmark: join with fast FBA + table row cache + hash join
-    var fba_buf: [131072]u8 = undefined; // 128KB for join results
+    var prep_join = exec.prepare(join_stmt, null) catch return 0;
+    defer prep_join.deinit();
+
     const timer = Timer.start();
     var i: u32 = 0;
     while (i < count) : (i += 1) {
-        var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
-        _ = exec.execute(join_stmt, fba.allocator()) catch {};
+        while (prep_join.step() catch break) |_| {}
+        prep_join.reset();
     }
     return timer.elapsedMs();
 }
@@ -850,9 +983,9 @@ fn benchJoin2TableSqlite(count: u32) f64 {
     var i: u32 = 0;
     while (i < 50) : (i += 1) {
         var buf: [128]u8 = undefined;
-        var sql = std.fmt.bufPrint(&buf, "INSERT INTO users VALUES ({d}, 'user_{d}')", .{ i, i }) catch continue;
+        var sql = std.fmt.bufPrintZ(&buf, "INSERT INTO users VALUES ({d}, 'user_{d}')", .{ i, i }) catch continue;
         _ = c.sqlite3_exec(db, sql.ptr, null, null, null);
-        sql = std.fmt.bufPrint(&buf, "INSERT INTO orders VALUES ({d}, {d}, {d})", .{ i, i % 50, i * 100 }) catch continue;
+        sql = std.fmt.bufPrintZ(&buf, "INSERT INTO orders VALUES ({d}, {d}, {d})", .{ i, i % 50, i * 100 }) catch continue;
         _ = c.sqlite3_exec(db, sql.ptr, null, null, null);
     }
 
@@ -861,10 +994,23 @@ fn benchJoin2TableSqlite(count: u32) f64 {
 
     const timer = Timer.start();
     i = 0;
+    var sqlite_rows: usize = 0;
     while (i < count) : (i += 1) {
-        while (c.sqlite3_step(join_stmt) == c.SQLITE_ROW) {}
+        var res: c_int = 0;
+        while (true) {
+            res = c.sqlite3_step(join_stmt);
+            if (res == c.SQLITE_ROW) {
+                sqlite_rows += 1;
+            } else {
+                break;
+            }
+        }
+        if (res != c.SQLITE_DONE) {
+            std.debug.print("SQLITE ERROR: {d}\n", .{res});
+        }
         _ = c.sqlite3_reset(join_stmt);
     }
+    std.debug.print("SQLite yielded {d} rows\n", .{sqlite_rows});
     _ = c.sqlite3_finalize(join_stmt);
     return timer.elapsedMs();
 }
@@ -899,6 +1045,9 @@ fn benchPreparedInsertZqlite(allocator: std.mem.Allocator, count: u32) f64 {
     // Wrap in transaction to avoid per-row fsync
     _ = zqliteExecSql(&exec, allocator, "BEGIN TRANSACTION") catch return 0;
 
+    var prep_ins = exec.prepare(stmt, null) catch return 0;
+    defer prep_ins.deinit();
+
     const timer = Timer.start();
     var i: u32 = 0;
     while (i < count) : (i += 1) {
@@ -906,7 +1055,9 @@ fn benchPreparedInsertZqlite(allocator: std.mem.Allocator, count: u32) f64 {
             .{ .integer = @intCast(i) },
             .{ .integer = @intCast(i * 42) },
         };
-        _ = exec.executeWithParams(stmt, &params, arena_state.allocator()) catch continue;
+        prep_ins.bindParams(&params);
+        _ = prep_ins.step() catch continue;
+        prep_ins.reset();
     }
     _ = zqliteExecSql(&exec, allocator, "COMMIT") catch {};
     return timer.elapsedMs();
@@ -1025,6 +1176,16 @@ pub fn main() void {
         const z = benchIndexLookupZqlite(allocator, count);
         const s = benchIndexLookupSqlite(count);
         results[num_results] = .{ .name = "index_lookup", .zqlite_ms = z, .sqlite_ms = s };
+        num_results += 1;
+    }
+
+    // Benchmark 7.5: Index Covering
+    {
+        const count: u32 = 5000;
+        print("Running index_covering ({d} covering indexed lookups)...\n", .{count});
+        const z = benchIndexCoveringZqlite(allocator, count);
+        const s = benchIndexCoveringSqlite(count);
+        results[num_results] = .{ .name = "index_covering", .zqlite_ms = z, .sqlite_ms = s };
         num_results += 1;
     }
 

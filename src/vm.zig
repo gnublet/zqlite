@@ -71,6 +71,9 @@ pub const Opcode = enum(u8) {
     // Index operations
     idx_insert = 80,
     idx_search = 81,
+    idx_next = 82,
+    idx_rowid = 83,
+    seek_rowid = 84,
 
     // Aggregation
     agg_step = 90,
@@ -188,8 +191,9 @@ fn recordValueToRegister(rv: record.Value) Register {
 // VM — the execution engine
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub const ResultRow = struct {
-    values: []Register,
+pub const StepResult = enum {
+    row,
+    done,
 };
 
 /// B-tree cursor state for open_read/open_write opcodes
@@ -198,13 +202,13 @@ const CursorState = struct {
     cur: cursor_mod.Cursor,
     valid: bool,
     is_write: bool,
+    header_cache: record.HeaderCache = .{},
 };
 
 pub const VM = struct {
     registers: []Register,
     pc: u32,
     program: Program,
-    results: std.ArrayList(ResultRow),
     allocator: std.mem.Allocator,
     halted: bool,
     pool: ?*pager.BufferPool,
@@ -223,7 +227,6 @@ pub const VM = struct {
             .registers = regs,
             .pc = 0,
             .program = program,
-            .results = .{},
             .allocator = allocator,
             .halted = false,
             .pool = null,
@@ -234,34 +237,20 @@ pub const VM = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        for (self.results.items) |row| {
-            self.allocator.free(row.values);
-        }
-        self.results.deinit(self.allocator);
         self.allocator.free(self.registers);
     }
 
-    /// Execute the program to completion.
-    pub fn execute(self: *Self) !void {
+    /// Execute the program until it yields a row or finishes.
+    pub fn step(self: *Self) !StepResult {
         while (!self.halted and self.pc < self.program.instructions.len) {
-            try self.step();
-        }
-    }
+            const instr = self.program.instructions[self.pc];
+            self.pc += 1;
 
-    /// Execute a single instruction.
-    pub fn step(self: *Self) !void {
-        if (self.pc >= self.program.instructions.len) {
-            self.halted = true;
-            return;
-        }
-
-        const instr = self.program.instructions[self.pc];
-        self.pc += 1;
-
-        switch (instr.opcode) {
-            .halt => {
-                self.halted = true;
-            },
+            switch (instr.opcode) {
+                .halt => {
+                    self.halted = true;
+                    return .done;
+                },
             .integer => {
                 const reg: usize = @intCast(instr.p1);
                 self.registers[reg] = .{ .integer = @as(i64, instr.p2) };
@@ -338,11 +327,7 @@ pub const VM = struct {
                 }
             },
             .result_row => {
-                const start: usize = @intCast(instr.p1);
-                const count: usize = @intCast(instr.p2);
-                const vals = try self.allocator.alloc(Register, count);
-                @memcpy(vals, self.registers[start .. start + count]);
-                try self.results.append(self.allocator, .{ .values = vals });
+                return .row;
             },
             .copy => {
                 const src: usize = @intCast(instr.p1);
@@ -377,6 +362,7 @@ pub const VM = struct {
                         .cur = undefined,
                         .valid = true,
                         .is_write = true,
+                        .header_cache = .{},
                     };
                 }
             },
@@ -384,6 +370,7 @@ pub const VM = struct {
                 // p1 = cursor_id, p2 = jump_target (if table is empty)
                 const cid: usize = @intCast(instr.p1);
                 if (self.cursors[cid]) |*cs| {
+                    cs.header_cache.reset();
                     cs.cur = cursor_mod.Cursor.init(&cs.bt);
                     cs.cur.first() catch {
                         cs.valid = false;
@@ -400,6 +387,7 @@ pub const VM = struct {
                 // p1 = cursor_id, p2 = jump_target (loop back)
                 const cid: usize = @intCast(instr.p1);
                 if (self.cursors[cid]) |*cs| {
+                    cs.header_cache.reset();
                     _ = cs.cur.next() catch {};
                     cs.valid = cs.cur.valid;
                     if (cs.valid) {
@@ -416,9 +404,9 @@ pub const VM = struct {
                     if (cs.valid) {
                         const entry = cs.cur.cell() catch {
                             self.registers[dst] = .{ .null_val = {} };
-                            return;
+                            continue;
                         };
-                        const rv = record.readColumn(entry.payload, col_idx) catch record.Value{ .null_val = {} };
+                        const rv = record.readColumnCached(entry.payload, col_idx, &cs.header_cache) catch record.Value{ .null_val = {} };
                         self.registers[dst] = recordValueToRegister(rv);
                     } else {
                         self.registers[dst] = .{ .null_val = {} };
@@ -433,7 +421,7 @@ pub const VM = struct {
                     if (cs.valid) {
                         const entry = cs.cur.cell() catch {
                             self.registers[dst] = .{ .null_val = {} };
-                            return;
+                            continue;
                         };
                         self.registers[dst] = .{ .integer = entry.key };
                     }
@@ -456,12 +444,12 @@ pub const VM = struct {
                 var buf: [4096]u8 = undefined;
                 const size = record.serializeRecord(rec_vals[0..count], &buf) catch {
                     self.registers[dst] = .{ .null_val = {} };
-                    return;
+                    continue;
                 };
                 // Store serialized bytes as blob
                 const data = self.allocator.dupe(u8, buf[0..size]) catch {
                     self.registers[dst] = .{ .null_val = {} };
-                    return;
+                    continue;
                 };
                 self.registers[dst] = .{ .blob = data };
             },
@@ -474,11 +462,11 @@ pub const VM = struct {
                     const rowid_val = self.registers[rid_reg];
                     const rid: i64 = switch (rowid_val) {
                         .integer => |v| v,
-                        else => return,
+                        else => continue,
                     };
                     const payload = switch (self.registers[rec_reg]) {
                         .blob => |b| b,
-                        else => return,
+                        else => continue,
                     };
                     cs.bt.insert(rid, payload) catch {};
                     self.rows_affected += 1;
@@ -497,9 +485,99 @@ pub const VM = struct {
                 }
             },
 
+            .idx_search => {
+                // p1 = cursor_id, p2 = key_reg, p3 = jump_not_found
+                const cid: usize = @intCast(instr.p1);
+                const key_reg: usize = @intCast(instr.p2);
+                const jump_pc: u32 = @intCast(instr.p3);
+                if (self.cursors[cid]) |*cs| {
+                    cs.header_cache.reset();
+                    const search_key_val = self.registers[key_reg].toRecordValue();
+                    var buf: [4096]u8 = undefined;
+                    const size = record.serializeRecord(&[_]record.Value{search_key_val}, &buf) catch {
+                        self.pc = jump_pc;
+                        continue;
+                    };
+                    const key_bytes = buf[0..size];
+
+                    const found = cs.cur.seekIndex(key_bytes) catch false;
+                    cs.valid = cs.cur.valid;
+                    if (!found) {
+                        self.pc = jump_pc;
+                    }
+                } else {
+                    self.pc = jump_pc;
+                }
+            },
+            .idx_next => {
+                // p1 = cursor_id, p2 = key_reg, p3 = jump_loop
+                const cid: usize = @intCast(instr.p1);
+                const key_reg: usize = @intCast(instr.p2);
+                const jump_pc: u32 = @intCast(instr.p3);
+                if (self.cursors[cid]) |*cs| {
+                    cs.header_cache.reset();
+                    if (cs.cur.next() catch false) {
+                        const search_key_val = self.registers[key_reg].toRecordValue();
+                        var buf: [4096]u8 = undefined;
+                        const size = record.serializeRecord(&[_]record.Value{search_key_val}, &buf) catch continue;
+                        const key_bytes = buf[0..size];
+                        
+                        const matches = cs.cur.indexKeyEquals(key_bytes) catch false;
+                        if (matches) {
+                            self.pc = jump_pc;
+                        } else {
+                            cs.valid = false;
+                        }
+                    } else {
+                        cs.valid = false;
+                    }
+                }
+            },
+            .idx_rowid => {
+                // p1 = cursor_id, p2 = dest_reg
+                const cid: usize = @intCast(instr.p1);
+                const dst: usize = @intCast(instr.p2);
+                if (self.cursors[cid]) |*cs| {
+                    if (cs.valid) {
+                        const rowid = cs.cur.indexRowid() catch {
+                            self.registers[dst] = .{ .null_val = {} };
+                            continue;
+                        };
+                        self.registers[dst] = .{ .integer = rowid };
+                    }
+                }
+            },
+            .seek_rowid => {
+                // p1 = cursor_id, p2 = rowid_reg, p3 = jump_not_found
+                const cid: usize = @intCast(instr.p1);
+                const rid_reg: usize = @intCast(instr.p2);
+                const jump_pc: u32 = @intCast(instr.p3);
+                if (self.cursors[cid]) |*cs| {
+                    cs.header_cache.reset();
+                    const rowid = switch (self.registers[rid_reg]) {
+                        .integer => |v| v,
+                        else => {
+                            self.pc = jump_pc;
+                            continue;
+                        },
+                    };
+                    const found = cs.cur.seek(rowid) catch false;
+                    cs.valid = cs.cur.valid;
+                    if (!found) {
+                        self.pc = jump_pc;
+                    }
+                } else {
+                    self.pc = jump_pc;
+                }
+            },
+
             // Stubs for unimplemented opcodes
-            .delete, .idx_insert, .idx_search, .agg_step, .agg_final, .sorter_open, .sorter_insert, .sorter_sort, .sorter_data, .sorter_next, .transaction, .commit, .rollback, .move, .concat, .like, .compare, .prev_row => {},
-        }
+            .delete, .idx_insert, .agg_step, .agg_final, .sorter_open, .sorter_insert, .sorter_sort, .sorter_data, .sorter_next, .transaction, .commit, .rollback, .move, .concat, .like, .compare, .prev_row => {},
+        } // end switch
+        } // end while
+        
+        self.halted = true;
+        return .done;
     }
 
     // ─── Arithmetic helpers ─────────────────────────────────────────
@@ -596,10 +674,9 @@ test "VM basic arithmetic" {
     var vm_inst = try VM.init(std.testing.allocator, program);
     defer vm_inst.deinit();
 
-    try vm_inst.execute();
-
-    try std.testing.expectEqual(@as(usize, 1), vm_inst.results.items.len);
-    try std.testing.expectEqual(@as(i64, 30), vm_inst.results.items[0].values[0].integer);
+    try std.testing.expectEqual(StepResult.row, try vm_inst.step());
+    try std.testing.expectEqual(@as(i64, 30), vm_inst.registers[2].integer);
+    try std.testing.expectEqual(StepResult.done, try vm_inst.step());
 }
 
 test "VM comparison and conditional jump" {
@@ -621,9 +698,9 @@ test "VM comparison and conditional jump" {
 
     var vm_inst = try VM.init(std.testing.allocator, program);
     defer vm_inst.deinit();
-    try vm_inst.execute();
-
-    try std.testing.expectEqual(@as(i64, 1), vm_inst.results.items[0].values[0].integer);
+    try std.testing.expectEqual(StepResult.row, try vm_inst.step());
+    try std.testing.expectEqual(@as(i64, 1), vm_inst.registers[3].integer);
+    try std.testing.expectEqual(StepResult.done, try vm_inst.step());
 }
 
 test "VM string register" {
@@ -640,7 +717,7 @@ test "VM string register" {
 
     var vm_inst = try VM.init(std.testing.allocator, program);
     defer vm_inst.deinit();
-    try vm_inst.execute();
-
-    try std.testing.expectEqualStrings("hello", vm_inst.results.items[0].values[0].text);
+    try std.testing.expectEqual(StepResult.row, try vm_inst.step());
+    try std.testing.expectEqualStrings("hello", vm_inst.registers[0].text);
+    try std.testing.expectEqual(StepResult.done, try vm_inst.step());
 }

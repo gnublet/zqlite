@@ -1,6 +1,7 @@
 const std = @import("std");
 const btree = @import("btree.zig");
 const pager = @import("pager.zig");
+const record = @import("record.zig");
 
 /// B-tree cursor — provides sequential and random access to B-tree entries.
 ///
@@ -303,26 +304,161 @@ pub const Cursor = struct {
         self.depth = 0;
         self.valid = false;
 
-        const page = try self.getCachedPage(self.bt.root_page_id);
+        var page_id = self.bt.root_page_id;
 
-        const bp = btree.BtreePage{ .page = page, .page_size = self.bt.page_size, .pool = null };
+        while (true) {
+            const page = try self.getCachedPage(page_id);
+            const bp = btree.BtreePage{ .page = page, .page_size = self.bt.page_size, .pool = null };
 
-        if (bp.cellCount() == 0) return false;
+            if (bp.isLeaf()) {
+                const found = bp.searchTableLeaf(rowid) catch return CursorError.BtreeError;
+                if (found) |idx| {
+                    self.stack[self.depth] = .{
+                        .page_id = page_id,
+                        .cell_index = idx,
+                    };
+                    self.depth += 1;
+                    self.valid = true;
+                    return true;
+                }
+                return false;
+            }
 
-        // Binary search on the leaf
-        const found = bp.searchTableLeaf(rowid) catch return CursorError.BtreeError;
+            // Interior node: binary search to find child
+            const count = bp.cellCount();
+            var lo: u16 = 0;
+            var hi: u16 = count;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const cell_off: usize = bp.cellPointer(mid);
+                const key_info = record.getVarint(page.data[cell_off + 4 ..]) catch return CursorError.BtreeError;
+                const node_key: i64 = @bitCast(key_info.value);
+                if (node_key < rowid) {
+                    lo = mid + 1;
+                } else if (node_key > rowid) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                    break;
+                }
+            }
 
-        if (found) |idx| {
-            self.stack[0] = .{
-                .page_id = self.bt.root_page_id,
-                .cell_index = idx,
+            self.stack[self.depth] = .{
+                .page_id = page_id,
+                .cell_index = lo,
             };
-            self.depth = 1;
-            self.valid = true;
-            return true;
-        }
+            self.depth += 1;
 
-        return false;
+            if (lo < count) {
+                const cell_off: usize = bp.cellPointer(lo);
+                page_id = std.mem.readInt(u32, page.data[cell_off..][0..4], .big);
+            } else {
+                page_id = bp.rightChild();
+            }
+        }
+    }
+
+    /// Seek to the first index entry matching `key_bytes` (or the first entry >= key_bytes).
+    /// Returns true if an exact match is found.
+    pub fn seekIndex(self: *Self, key_bytes: []const u8) CursorError!bool {
+        self.depth = 0;
+        self.valid = false;
+
+        var page_id = self.bt.root_page_id;
+
+        while (true) {
+            const page = try self.getCachedPage(page_id);
+            const bp = btree.BtreePage{ .page = page, .page_size = self.bt.page_size, .pool = null };
+            const count = bp.cellCount();
+
+            // Binary search on page
+            var lo: u16 = 0;
+            var hi: u16 = count;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (bp.isLeaf()) {
+                    const mid_cell = bp.readIndexCell(bp.cellPointer(mid)) catch return CursorError.BtreeError;
+                    const cmp = std.mem.order(u8, mid_cell.key, key_bytes);
+                    switch (cmp) {
+                        .lt => lo = mid + 1,
+                        .gt => hi = mid,
+                        .eq => hi = mid, // Narrow to find the very first match
+                    }
+                } else {
+                    // Interior Index Cell: left_child(4) + payload_size + key_bytes + rowid
+                    // Actually, we can just read it like a leaf cell, but offset by 4 bytes.
+                    var cell_off = bp.cellPointer(mid);
+                    cell_off += 4; // skip left child pointer
+                    const ps_info = record.getVarint(page.data[cell_off..]) catch return CursorError.BtreeError;
+                    const payload_size: usize = @intCast(ps_info.value);
+                    const payload_start = cell_off + ps_info.bytes;
+                    
+                    // Extract key bytes from payload (like readIndexCell)
+                    var pos = payload_start;
+                    var last_varint_start = pos;
+                    const payload_end = payload_start + payload_size;
+                    while (pos < payload_end) {
+                        last_varint_start = pos;
+                        const vi = record.getVarint(page.data[pos..]) catch return CursorError.BtreeError;
+                        pos += vi.bytes;
+                    }
+                    const mid_key_bytes = page.data[payload_start..last_varint_start];
+                    
+                    const cmp = std.mem.order(u8, mid_key_bytes, key_bytes);
+                    switch (cmp) {
+                        .lt => lo = mid + 1,
+                        .gt => hi = mid,
+                        .eq => hi = mid,
+                    }
+                }
+            }
+
+            self.stack[self.depth] = .{
+                .page_id = page_id,
+                .cell_index = lo,
+            };
+            self.depth += 1;
+
+            if (bp.isLeaf()) {
+                if (lo < count) {
+                    self.valid = true;
+                    const idx_cell = bp.readIndexCell(bp.cellPointer(lo)) catch return CursorError.BtreeError;
+                    return std.mem.eql(u8, idx_cell.key, key_bytes);
+                }
+                return false;
+            } else {
+                if (lo < count) {
+                    const cell_off: usize = bp.cellPointer(lo);
+                    page_id = std.mem.readInt(u32, page.data[cell_off..][0..4], .big);
+                } else {
+                    page_id = bp.rightChild();
+                }
+            }
+        }
+    }
+
+    /// Read the rowid from the current index cell.
+    pub fn indexRowid(self: *Self) CursorError!i64 {
+        if (!self.valid) return CursorError.InvalidPosition;
+
+        const entry = self.stack[self.depth - 1];
+        const page = try self.getCachedPage(entry.page_id);
+        const bp = btree.BtreePage{ .page = page, .page_size = self.bt.page_size, .pool = null };
+        
+        const idx_cell = bp.readIndexCell(bp.cellPointer(entry.cell_index)) catch return CursorError.BtreeError;
+        return idx_cell.rowid;
+    }
+
+    /// Returns true if the current index cell's key exactly matches `key_bytes`.
+    pub fn indexKeyEquals(self: *Self, key_bytes: []const u8) CursorError!bool {
+        if (!self.valid) return CursorError.InvalidPosition;
+
+        const entry = self.stack[self.depth - 1];
+        const page = try self.getCachedPage(entry.page_id);
+        const bp = btree.BtreePage{ .page = page, .page_size = self.bt.page_size, .pool = null };
+        
+        const idx_cell = bp.readIndexCell(bp.cellPointer(entry.cell_index)) catch return CursorError.BtreeError;
+        return std.mem.eql(u8, idx_cell.key, key_bytes);
     }
 };
 

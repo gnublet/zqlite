@@ -183,11 +183,6 @@ pub fn main() void {
             };
             defer vm.deinit();
 
-            vm.execute() catch {
-                print("Error: execution failed.\n", .{});
-                continue;
-            };
-
             // Print column headers
             if (program.column_names.len > 0) {
                 for (program.column_names, 0..) |name, i| {
@@ -202,10 +197,22 @@ pub fn main() void {
                 writeAll("\n");
             }
 
-            for (vm.results.items) |row| {
-                for (row.values, 0..) |val, i| {
+            var row_count: usize = 0;
+            while (true) {
+                const res = vm.step() catch {
+                    print("Error: execution failed.\n", .{});
+                    break;
+                };
+                if (res == .done) break;
+
+                row_count += 1;
+                const instr = vm.program.instructions[vm.pc - 1];
+                const start: usize = @intCast(instr.p1);
+                const count: usize = @intCast(instr.p2);
+
+                for (0..count) |i| {
                     if (i > 0) writeAll(" | ");
-                    switch (val) {
+                    switch (vm.registers[start + i]) {
                         .integer => |v| print("{d}", .{v}),
                         .real => |v| print("{d}", .{v}),
                         .text => |v| print("{s}", .{v}),
@@ -216,7 +223,7 @@ pub fn main() void {
                 }
                 writeAll("\n");
             }
-            if (vm.results.items.len == 0) writeAll("OK\n");
+            if (row_count == 0) writeAll("OK\n");
         } else {
             // Table-touching statement → executor
             const result = exec.execute(stmt, arena.allocator()) catch |err| {

@@ -382,6 +382,42 @@ pub fn deserializeRecord(buf: []const u8, allocator: std.mem.Allocator) RecordEr
     return values;
 }
 
+pub const HeaderCache = struct {
+    offsets: [64]u32 = .{0} ** 64,
+    types: [64]u64 = .{0} ** 64,
+    hdr_pos: usize = 0,
+    body_offset: usize = 0,
+    header_len: usize = 0,
+    num_cached_cols: usize = 0,
+
+    pub fn reset(self: *HeaderCache) void {
+        self.num_cached_cols = 0;
+    }
+};
+
+inline fn decodeSerial(st: u64, content: []const u8) Value {
+    switch (st) {
+        0 => return .{ .null_val = {} },
+        1, 2, 3, 4, 5, 6 => return .{ .integer = readIntBigEndian(content, content.len) },
+        7 => {
+            const bits = std.mem.readInt(u64, content[0..8], .big);
+            return .{ .real = @bitCast(bits) };
+        },
+        8 => return .{ .integer = 0 },
+        9 => return .{ .integer = 1 },
+        else => {
+            if (st >= 12) {
+                if (st % 2 == 0) {
+                    return .{ .blob = content };
+                } else {
+                    return .{ .text = content };
+                }
+            }
+            return .{ .null_val = {} };
+        },
+    }
+}
+
 /// Read a column from a record by index WITHOUT deserializing the entire record.
 /// This is the "lazy deserialization" optimization.
 pub fn readColumn(buf: []const u8, col_index: usize) RecordError!Value {
@@ -403,32 +439,56 @@ pub fn readColumn(buf: []const u8, col_index: usize) RecordError!Value {
         if (col == col_index) {
             // Decode this column
             if (body_offset + len > buf.len) return RecordError.CorruptRecord;
-            return switch (st) {
-                0 => .{ .null_val = {} },
-                1, 2, 3, 4, 5, 6 => .{ .integer = readIntBigEndian(buf[body_offset .. body_offset + len], len) },
-                7 => blk: {
-                    const bits = std.mem.readInt(u64, buf[body_offset..][0..8], .big);
-                    break :blk .{ .real = @bitCast(bits) };
-                },
-                8 => .{ .integer = 0 },
-                9 => .{ .integer = 1 },
-                else => blk: {
-                    if (st >= 12) {
-                        const content = buf[body_offset .. body_offset + len];
-                        if (st % 2 == 0) {
-                            break :blk .{ .blob = content };
-                        } else {
-                            break :blk .{ .text = content };
-                        }
-                    }
-                    break :blk .{ .null_val = {} };
-                },
-            };
+            return decodeSerial(st, buf[body_offset .. body_offset + len]);
         }
 
         body_offset += len;
         hdr_pos += tc_info.bytes;
         col += 1;
+    }
+
+    return RecordError.CorruptRecord;
+}
+
+pub fn readColumnCached(buf: []const u8, col_index: usize, cache: *HeaderCache) RecordError!Value {
+    if (col_index < cache.num_cached_cols) {
+        const st = cache.types[col_index];
+        const body_offset = cache.offsets[col_index];
+        const len = serialTypeLen(st);
+        if (body_offset + len > buf.len) return RecordError.CorruptRecord;
+        return decodeSerial(st, buf[body_offset .. body_offset + len]);
+    }
+
+    if (cache.num_cached_cols == 0) {
+        const header_info = getVarint(buf) catch return RecordError.CorruptRecord;
+        const header_len = header_info.value;
+        if (header_len > buf.len) return RecordError.CorruptRecord;
+        
+        cache.header_len = @intCast(header_len);
+        cache.hdr_pos = header_info.bytes;
+        cache.body_offset = @intCast(header_len);
+    }
+
+    while (cache.hdr_pos < cache.header_len and cache.num_cached_cols <= col_index) {
+        const tc_info = getVarint(buf[cache.hdr_pos..]) catch return RecordError.CorruptRecord;
+        const st = tc_info.value;
+        const len = serialTypeLen(st);
+
+        if (cache.num_cached_cols < 64) {
+            cache.types[cache.num_cached_cols] = st;
+            cache.offsets[cache.num_cached_cols] = @intCast(cache.body_offset);
+            cache.hdr_pos += tc_info.bytes;
+            cache.body_offset += len;
+            cache.num_cached_cols += 1;
+
+            if (cache.num_cached_cols - 1 == col_index) {
+                const body_offset = cache.offsets[col_index];
+                if (body_offset + len > buf.len) return RecordError.CorruptRecord;
+                return decodeSerial(st, buf[body_offset .. body_offset + len]);
+            }
+        } else {
+            return RecordError.TooManyColumns;
+        }
     }
 
     return RecordError.CorruptRecord;

@@ -7,6 +7,9 @@ const os = @import("os.zig");
 const pager = @import("pager.zig");
 const record = @import("record.zig");
 const schema = @import("schema.zig");
+const vm_mod = @import("vm.zig");
+const planner = @import("planner.zig");
+const codegen = @import("codegen.zig");
 
 /// Module-level bound params for prepared statement execution.
 /// Set by executeWithParams, read by expression evaluation functions.
@@ -134,41 +137,8 @@ pub const Executor = struct {
     file: ?*os.FileHandle,
     bound_params: ?[]const record.Value,
     schema_version: u64,
-    select_cache: std.AutoHashMap(usize, CachedSelectPlan),
-    join_cache: std.AutoHashMap(usize, CachedJoinPlan),
-    table_row_cache: std.AutoHashMap(u32, CachedTableRows),
     data_version: u64,
-
-    // ── Compiled Plan Cache types ────────────────────────────
-
-    const CachedSelectPlan = struct {
-        table_name: []const u8,
-        root_page: u32,
-        columns: []const schema.Column,
-        compiled_where: ?WhereCompiled,
-        col_indices: []?usize,
-        col_names: [][]const u8,
-        is_star: bool,
-        num_output_cols: usize,
-        schema_version: u64,
-    };
-
-    const CachedJoinPlan = struct {
-        left_table: schema.Table,
-        right_table: schema.Table,
-        left_on_idx: ?usize,
-        right_on_idx: ?usize,
-        total_cols: usize,
-        is_star: bool,
-        schema_version: u64,
-    };
-
-    const CachedTableRows = struct {
-        rows: [][]record.Value, // each row is a []record.Value
-        schema_version: u64,
-        root_page: u32,
-        data_version: u64,
-    };
+    vm_program_cache: std.AutoHashMap(usize, vm_mod.Program),
 
     const Self = @This();
 
@@ -183,25 +153,30 @@ pub const Executor = struct {
             .file = null,
             .bound_params = null,
             .schema_version = 0,
-            .select_cache = std.AutoHashMap(usize, CachedSelectPlan).init(allocator),
-            .join_cache = std.AutoHashMap(usize, CachedJoinPlan).init(allocator),
-            .table_row_cache = std.AutoHashMap(u32, CachedTableRows).init(allocator),
             .data_version = 0,
+            .vm_program_cache = std.AutoHashMap(usize, vm_mod.Program).init(allocator),
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.select_cache.deinit();
-        self.join_cache.deinit();
-        self.table_row_cache.deinit();
+        var iter = self.vm_program_cache.iterator();
+        while (iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.instructions);
+            self.allocator.free(entry.value_ptr.column_names);
+        }
+        self.vm_program_cache.deinit();
     }
 
     /// Invalidate all cached plans (called on DDL)
     fn invalidatePlans(self: *Self) void {
         self.schema_version +%= 1;
-        self.select_cache.clearRetainingCapacity();
-        self.join_cache.clearRetainingCapacity();
-        self.table_row_cache.clearRetainingCapacity();
+
+        var iter = self.vm_program_cache.iterator();
+        while (iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.instructions);
+            self.allocator.free(entry.value_ptr.column_names);
+        }
+        self.vm_program_cache.clearRetainingCapacity();
     }
 
     /// Invalidate table row cache (called on INSERT/UPDATE/DELETE)
@@ -254,57 +229,110 @@ pub const Executor = struct {
         return self.execute(stmt, arena);
     }
 
-    /// Execute a statement via the bytecode VM (VDBE-like).
-    /// Compiles AST → bytecode → executes on register VM → returns ExecResult.
-    /// Much faster than AST tree walking for repeated queries.
-    pub fn executeViaVM(self: *Self, stmt: ast.Statement, params: ?[]const record.Value, arena: std.mem.Allocator) ExecError!ExecResult {
-        const codegen = @import("codegen.zig");
-        const vm_mod = @import("vm.zig");
+    pub const Statement = struct {
+        vm: *vm_mod.VM,
+        arena: *std.heap.ArenaAllocator,
+        parent_allocator: std.mem.Allocator,
+        row_buf: []record.Value,
+        column_names: [][]const u8,
 
-        // Compile AST → bytecode
-        var compiler = codegen.Compiler.initWithSchema(arena, self.schema_store);
-        const program = compiler.compile(stmt) catch return ExecError.StorageError;
+        pub fn deinit(self: *Statement) void {
+            self.vm.deinit();
+            self.arena.deinit();
+            self.parent_allocator.destroy(self.arena);
+        }
 
-        // Create VM with pool access
-        var vm_inst = vm_mod.VM.init(arena, program) catch return ExecError.StorageError;
-        vm_inst.pool = self.pool;
-        vm_inst.bound_params = params;
+        pub fn step(self: *Statement) !?[]const record.Value {
+            switch (try self.vm.step()) {
+                .done => return null,
+                .row => {
+                    const instr = self.vm.program.instructions[self.vm.pc - 1];
+                    std.debug.assert(instr.opcode == .result_row);
+                    const start: usize = @intCast(instr.p1);
+                    const count: usize = @intCast(instr.p2);
+                    std.debug.assert(count == self.row_buf.len);
 
-        // Execute
-        vm_inst.execute() catch return ExecError.StorageError;
-
-        // Convert VM results to ExecResult
-        if (vm_inst.results.items.len > 0) {
-            const rows = arena.alloc(ResultRow, vm_inst.results.items.len) catch
-                return ExecError.StorageError;
-            for (vm_inst.results.items, 0..) |vm_row, i| {
-                const vals = arena.alloc(Value, vm_row.values.len) catch
-                    return ExecError.StorageError;
-                for (vm_row.values, 0..) |reg, j| {
-                    vals[j] = switch (reg) {
-                        .null_val => .{ .null_val = {} },
-                        .integer => |v| .{ .integer = v },
-                        .real => |v| .{ .real = v },
-                        .text => |v| .{ .text = v },
-                        .blob => |v| .{ .text = v },
-                        .boolean => |v| .{ .integer = if (v) 1 else 0 },
-                    };
-                }
-                rows[i] = .{ .values = vals };
+                    for (0..count) |i| {
+                        const reg = self.vm.registers[start + i];
+                        self.row_buf[i] = switch (reg) {
+                            .null_val => .{ .null_val = {} },
+                            .integer => |v| .{ .integer = v },
+                            .real => |v| .{ .real = v },
+                            .text => |v| .{ .text = v },
+                            .blob => |v| .{ .text = v },
+                            .boolean => |v| .{ .integer = if (v) 1 else 0 },
+                        };
+                    }
+                    return self.row_buf;
+                },
             }
-            return ExecResult{
-                .rows = rows,
-                .column_names = @constCast(program.column_names),
-                .rows_affected = 0,
-                .message = null,
+        }
+
+        pub fn reset(self: *Statement) void {
+            self.vm.pc = 0;
+            self.vm.halted = false;
+            // Also need to clear cursors
+            for (&self.vm.cursors) |*cursor_opt| {
+                cursor_opt.* = null;
+            }
+        }
+
+        pub fn bindParams(self: *Statement, params: ?[]const record.Value) void {
+            self.vm.bound_params = params;
+        }
+    };
+
+    /// Prepare a statement into a bytecode string for streaming execution (VDBE-like).
+    pub fn prepare(self: *Self, stmt: ast.Statement, params: ?[]const record.Value) ExecError!Statement {
+        const cache_key: usize = switch (stmt) {
+            .select => |s| @intFromPtr(s.columns.ptr),
+            .insert => |i| @intFromPtr(i.table.ptr),
+            .update => |u| @intFromPtr(u.table.ptr),
+            .delete => |d| @intFromPtr(d.table.ptr),
+            else => return ExecError.StorageError, // unsupported for vm via cache right now
+        };
+
+        var program: vm_mod.Program = undefined;
+        if (self.vm_program_cache.get(cache_key)) |p| {
+            program = p;
+        } else {
+            var compiler = codegen.Compiler.initWithSchema(self.allocator, self.schema_store);
+            errdefer compiler.deinit();
+            
+            program = compiler.compile(stmt) catch |err| switch (err) {
+                error.TableNotFound => return ExecError.TableNotFound,
+                error.UnsupportedStatement => return ExecError.UnsupportedStatement,
+                error.UnsupportedExpression => return ExecError.UnsupportedExpr,
+                error.TooManyRegisters => return ExecError.StorageError,
+                error.AllocationFailed => return ExecError.StorageError,
+            };
+            
+            self.vm_program_cache.put(cache_key, program) catch {
+                compiler.deinit();
+                return ExecError.StorageError;
             };
         }
 
-        return ExecResult{
-            .rows = &.{},
+        const arena = self.allocator.create(std.heap.ArenaAllocator) catch return ExecError.StorageError;
+        arena.* = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer {
+            arena.deinit();
+            self.allocator.destroy(arena);
+        }
+
+        var vm_inst = arena.allocator().create(vm_mod.VM) catch return ExecError.StorageError;
+        vm_inst.* = vm_mod.VM.init(arena.allocator(), program) catch return ExecError.StorageError;
+        vm_inst.pool = self.pool;
+        vm_inst.bound_params = params;
+
+        const row_buf = arena.allocator().alloc(record.Value, program.column_names.len) catch return ExecError.StorageError;
+
+        return Statement{
+            .vm = vm_inst,
+            .arena = arena,
+            .parent_allocator = self.allocator,
+            .row_buf = row_buf,
             .column_names = @constCast(program.column_names),
-            .rows_affected = vm_inst.rows_affected,
-            .message = null,
         };
     }
 
@@ -364,7 +392,29 @@ pub const Executor = struct {
             .create_index => |ci| self.execCreateIndex(ci, arena),
             .drop_index => |di| self.execDropIndex(di, arena),
             .insert => |ins| self.execInsert(ins, arena),
-            .select => |sel| self.execSelect(sel, arena),
+            .select => |sel| {
+                var stmt_iter = try self.prepare(ast.Statement{ .select = sel }, self.bound_params);
+                defer stmt_iter.deinit();
+
+                var rows_list: std.ArrayList(ResultRow) = .{};
+                while (try stmt_iter.step()) |row_vals| {
+                    const vals_dupe = arena.alloc(Value, row_vals.len) catch return ExecError.StorageError;
+                    for (row_vals, 0..) |rv, i| {
+                        vals_dupe[i] = recordToValue(rv);
+                    }
+                    rows_list.append(arena, .{ .values = vals_dupe }) catch return ExecError.StorageError;
+                }
+
+                const col_names = arena.alloc([]const u8, stmt_iter.vm.program.column_names.len) catch return ExecError.StorageError;
+                for (stmt_iter.vm.program.column_names, 0..) |name, i| col_names[i] = name;
+
+                return ExecResult{
+                    .rows = rows_list.items,
+                    .column_names = col_names,
+                    .rows_affected = 0,
+                    .message = null,
+                };
+            },
             .delete => |del| self.execDelete(del, arena),
             .update => |upd| self.execUpdate(upd, arena),
             else => ExecError.UnsupportedStatement,
@@ -551,10 +601,17 @@ pub const Executor = struct {
             _ = cur.next() catch break;
         }
 
+        const owned_name = self.allocator.dupe(u8, ci.name) catch return ExecError.StorageError;
+        const owned_table = self.allocator.dupe(u8, ci.table) catch return ExecError.StorageError;
+        const owned_columns = self.allocator.alloc([]const u8, ci.columns.len) catch return ExecError.StorageError;
+        for (ci.columns, 0..) |col_name, idx| {
+            owned_columns[idx] = self.allocator.dupe(u8, col_name) catch return ExecError.StorageError;
+        }
+
         self.schema_store.addIndex(.{
-            .name = ci.name,
-            .table_name = ci.table,
-            .columns = ci.columns,
+            .name = owned_name,
+            .table_name = owned_table,
+            .columns = owned_columns,
             .root_page = idx_bt.root_page_id,
             .is_unique = ci.unique,
         }) catch return ExecError.StorageError;
@@ -691,887 +748,6 @@ pub const Executor = struct {
         };
     }
 
-    // ─── SELECT ──────────────────────────────────────────────────────
-
-    fn execSelect(self: *Self, sel: ast.Statement.Select, arena: std.mem.Allocator) ExecError!ExecResult {
-        const from = sel.from orelse return ExecError.UnsupportedExpr;
-
-        // ── Join path ────────────────────────────────────────────────
-        if (sel.joins.len > 0) {
-            return self.execJoinSelect(sel, from, arena);
-        }
-
-        const table_entry = self.schema_store.getTable(from.name) orelse
-            return ExecError.TableNotFound;
-
-        var bt = btree.Btree.open(self.pool, table_entry.root_page);
-
-        // ── Fast path: PRIMARY KEY point lookup ──────────────────────
-        // Detect WHERE pk_col = integer_literal and use bt.search() (O(log n))
-        // instead of full cursor scan (O(n)).
-        if (sel.where) |where_expr| {
-            if (table_entry.rowid_alias_col) |pk_idx| {
-                if (tryExtractPkLookup(where_expr, table_entry.columns, pk_idx)) |target_rowid| {
-                    return self.execPkLookup(&bt, sel, table_entry, target_rowid, arena);
-                }
-            }
-        }
-
-        // ── Index lookup fast-path ──────────────────────────────────
-        // Detect WHERE indexed_col = literal and use index B-tree
-        if (sel.where) |where_expr| {
-            if (self.tryIndexLookup(&bt, sel, table_entry, where_expr, arena)) |result| {
-                return result;
-            }
-        }
-
-        // ── Slow path: full cursor scan ──────────────────────────────
-        var cur = cursor.Cursor.init(&bt);
-        cur.first() catch return ExecError.StorageError;
-
-        // Check select plan cache — avoid re-resolving columns + WHERE per query
-        const cache_key = @intFromPtr(sel.columns.ptr);
-        var cached_plan: ?CachedSelectPlan = null;
-        if (self.select_cache.get(cache_key)) |cp| {
-            if (cp.schema_version == self.schema_version) {
-                cached_plan = cp;
-            }
-        }
-
-        // Use slices directly — zero allocation on cache hit
-        var col_names_slice: [][]const u8 = &.{};
-        var col_indices_slice: []const ?usize = &.{};
-        var is_star: bool = false;
-        var compiled_where: ?WhereCompiled = null;
-        var num_output_cols: usize = 0;
-
-        // Temporary ArrayLists only used on cache miss
-        var col_names_list: std.ArrayList([]const u8) = .{};
-        var col_indices_list: std.ArrayList(?usize) = .{};
-
-        if (cached_plan) |cp| {
-            // Cache hit — use pre-resolved data directly (zero allocation!)
-            is_star = cp.is_star;
-            compiled_where = cp.compiled_where;
-            col_names_slice = cp.col_names;
-            col_indices_slice = cp.col_indices;
-            num_output_cols = cp.num_output_cols;
-        } else {
-            // Cache miss — resolve columns and WHERE
-            for (sel.columns) |col| {
-                switch (col) {
-                    .all_columns => {
-                        is_star = true;
-                        for (table_entry.columns) |cc| {
-                            col_names_list.append(arena, cc.name) catch return ExecError.StorageError;
-                        }
-                    },
-                    .expr => |ec| {
-                        const name = ec.alias orelse exprName(ec.expr);
-                        col_names_list.append(arena, name) catch return ExecError.StorageError;
-                        const idx = resolveColumnIndex(ec.expr, table_entry.columns);
-                        col_indices_list.append(arena, idx) catch return ExecError.StorageError;
-                    },
-                    .table_all => {
-                        is_star = true;
-                        for (table_entry.columns) |cc| {
-                            col_names_list.append(arena, cc.name) catch return ExecError.StorageError;
-                        }
-                    },
-                }
-            }
-
-            col_names_slice = col_names_list.items;
-            col_indices_slice = col_indices_list.items;
-            num_output_cols = if (is_star) table_entry.columns.len else col_indices_list.items.len;
-
-            // Pre-compile WHERE
-            if (sel.where) |where_expr| {
-                const cw = compileSimpleWhere(where_expr, table_entry.columns, self.allocator);
-                if (cw.kind != .not_compiled) compiled_where = cw;
-            }
-
-            // Store in cache (use executor's allocator, not per-query arena)
-            const cached_names = self.allocator.dupe([]const u8, col_names_list.items) catch col_names_list.items;
-            const cached_indices = self.allocator.dupe(?usize, col_indices_list.items) catch col_indices_list.items;
-
-            self.select_cache.put(cache_key, .{
-                .table_name = table_entry.name,
-                .root_page = table_entry.root_page,
-                .columns = table_entry.columns,
-                .compiled_where = compiled_where,
-                .col_indices = cached_indices,
-                .col_names = cached_names,
-                .is_star = is_star,
-                .num_output_cols = num_output_cols,
-                .schema_version = self.schema_version,
-            }) catch {};
-        }
-
-        // Scan rows — pre-allocate flat values buffer (one alloc for ALL rows)
-        const pre_alloc_rows: usize = 256;
-        var vals_pool = arena.alloc(Value, pre_alloc_rows * num_output_cols) catch
-            return ExecError.StorageError;
-        var rows_buf: [pre_alloc_rows]ResultRow = undefined;
-        var row_count: usize = 0;
-
-        while (cur.valid) {
-            const entry = cur.cell() catch return ExecError.StorageError;
-
-            // Evaluate WHERE — use compiled fast path when available
-            if (sel.where) |where_expr| {
-                const matches = if (compiled_where) |*cw|
-                    evalWhereCompiled(cw, table_entry.columns, entry.payload) catch false
-                else
-                    evalWhereLazy(where_expr, table_entry.columns, entry.payload) catch false;
-                if (!matches) {
-                    _ = cur.next() catch return ExecError.StorageError;
-                    continue;
-                }
-            }
-
-            // Get value slice from pre-allocated pool (or re-alloc if overflow)
-            if (row_count >= pre_alloc_rows) {
-                // Fallback: grow with arena alloc for overflow rows
-                const extra = arena.alloc(Value, num_output_cols) catch return ExecError.StorageError;
-                var rows_list: std.ArrayList(ResultRow) = .{};
-                rows_list.appendSlice(arena, rows_buf[0..row_count]) catch return ExecError.StorageError;
-
-                if (is_star) {
-                    var decode_buf: [64]record.Value = undefined;
-                    const decoded = record.deserializeRecordBuf(entry.payload, &decode_buf) catch
-                        return ExecError.SerializationFailed;
-                    for (0..num_output_cols) |ci| {
-                        extra[ci] = if (ci < decoded.len) recordToValue(decoded[ci]) else .{ .null_val = {} };
-                    }
-                } else {
-                    for (col_indices_slice, 0..) |maybe_idx, ci| {
-                        if (maybe_idx) |idx| {
-                            const rv = record.readColumn(entry.payload, idx) catch record.Value{ .null_val = {} };
-                            extra[ci] = recordToValue(rv);
-                        } else {
-                            extra[ci] = .{ .null_val = {} };
-                        }
-                    }
-                }
-                rows_list.append(arena, .{ .values = extra }) catch return ExecError.StorageError;
-
-                _ = cur.next() catch return ExecError.StorageError;
-
-                // Drain remaining with ArrayList
-                while (cur.valid) {
-                    const e2 = cur.cell() catch return ExecError.StorageError;
-                    if (sel.where) |where_expr| {
-                        const m2 = evalWhereLazy(where_expr, table_entry.columns, e2.payload) catch false;
-                        if (!m2) { _ = cur.next() catch return ExecError.StorageError; continue; }
-                    }
-                    const extra2 = arena.alloc(Value, num_output_cols) catch return ExecError.StorageError;
-                    if (is_star) {
-                        var decode_buf2: [64]record.Value = undefined;
-                        const decoded2 = record.deserializeRecordBuf(e2.payload, &decode_buf2) catch return ExecError.SerializationFailed;
-                        for (0..num_output_cols) |ci| { extra2[ci] = if (ci < decoded2.len) recordToValue(decoded2[ci]) else .{ .null_val = {} }; }
-                    } else {
-                        for (col_indices_slice, 0..) |maybe_idx, ci| {
-                            if (maybe_idx) |idx| { extra2[ci] = recordToValue(record.readColumn(e2.payload, idx) catch record.Value{ .null_val = {} }); } else { extra2[ci] = .{ .null_val = {} }; }
-                        }
-                    }
-                    rows_list.append(arena, .{ .values = extra2 }) catch return ExecError.StorageError;
-                    _ = cur.next() catch return ExecError.StorageError;
-                }
-
-                return ExecResult{
-                    .rows = rows_list.items,
-                    .column_names = col_names_slice,
-                    .rows_affected = 0,
-                    .message = null,
-                };
-            }
-
-            const vals = vals_pool[row_count * num_output_cols ..][0..num_output_cols];
-
-            // Build result row
-            if (is_star) {
-                var decode_buf: [64]record.Value = undefined;
-                const decoded = record.deserializeRecordBuf(entry.payload, &decode_buf) catch
-                    return ExecError.SerializationFailed;
-                for (0..num_output_cols) |i| {
-                    vals[i] = if (i < decoded.len) recordToValue(decoded[i]) else .{ .null_val = {} };
-                }
-            } else {
-                for (col_indices_slice, 0..) |maybe_idx, i| {
-                    if (maybe_idx) |idx| {
-                        const rv = record.readColumn(entry.payload, idx) catch record.Value{ .null_val = {} };
-                        vals[i] = recordToValue(rv);
-                    } else {
-                        vals[i] = .{ .null_val = {} };
-                    }
-                }
-            }
-            rows_buf[row_count] = .{ .values = vals };
-            row_count += 1;
-
-            _ = cur.next() catch return ExecError.StorageError;
-        }
-
-        // Copy stack rows to arena-owned slice for stable return
-        const result_rows = arena.dupe(ResultRow, rows_buf[0..row_count]) catch
-            return ExecError.StorageError;
-
-        return ExecResult{
-            .rows = result_rows,
-            .column_names = col_names_slice,
-            .rows_affected = 0,
-            .message = null,
-        };
-    }
-
-    /// Fast path: direct B-tree search for a single rowid.
-    fn execPkLookup(
-        self: *Self,
-        bt: *btree.Btree,
-        sel: ast.Statement.Select,
-        table_entry: schema.Table,
-        target_rowid: i64,
-        arena: std.mem.Allocator,
-    ) ExecError!ExecResult {
-        _ = self;
-        const cell_result = bt.search(target_rowid) catch return ExecError.StorageError;
-
-        // Build column names
-        var col_names_list: std.ArrayList([]const u8) = .{};
-        var is_star = false;
-        var col_indices: std.ArrayList(?usize) = .{};
-
-        for (sel.columns) |col| {
-            switch (col) {
-                .all_columns, .table_all => {
-                    is_star = true;
-                    for (table_entry.columns) |cc| {
-                        col_names_list.append(arena, cc.name) catch return ExecError.StorageError;
-                    }
-                },
-                .expr => |ec| {
-                    col_names_list.append(arena, ec.alias orelse exprName(ec.expr)) catch return ExecError.StorageError;
-                    col_indices.append(arena, resolveColumnIndex(ec.expr, table_entry.columns)) catch return ExecError.StorageError;
-                },
-            }
-        }
-
-        var rows_list: std.ArrayList(ResultRow) = .{};
-
-        if (cell_result) |entry| {
-            const decoded = record.deserializeRecord(entry.payload, arena) catch
-                return ExecError.SerializationFailed;
-
-            if (is_star) {
-                const vals = arena.alloc(Value, table_entry.columns.len) catch return ExecError.StorageError;
-                for (0..table_entry.columns.len) |i| {
-                    vals[i] = if (i < decoded.len) recordToValue(decoded[i]) else .{ .null_val = {} };
-                }
-                rows_list.append(arena, .{ .values = vals }) catch return ExecError.StorageError;
-            } else {
-                const vals = arena.alloc(Value, col_indices.items.len) catch return ExecError.StorageError;
-                for (col_indices.items, 0..) |maybe_idx, i| {
-                    if (maybe_idx) |idx| {
-                        vals[i] = if (idx < decoded.len) recordToValue(decoded[idx]) else .{ .null_val = {} };
-                    } else {
-                        vals[i] = .{ .null_val = {} };
-                    }
-                }
-                rows_list.append(arena, .{ .values = vals }) catch return ExecError.StorageError;
-            }
-        }
-
-        return ExecResult{
-            .rows = rows_list.items,
-            .column_names = col_names_list.items,
-            .rows_affected = 0,
-            .message = null,
-        };
-    }
-
-    /// Try to use an index for WHERE col = literal lookups.
-    /// Returns null if no index can be used.
-    fn tryIndexLookup(
-        self: *Self,
-        bt: *btree.Btree,
-        sel: ast.Statement.Select,
-        table_entry: schema.Table,
-        where_expr: *ast.Expr,
-        arena: std.mem.Allocator,
-    ) ?ExecResult {
-        // Only handle simple equality: col = literal
-        const eq_op = switch (where_expr.*) {
-            .binary_op => |bop| if (bop.op == .eq) bop else return null,
-            else => return null,
-        };
-
-        // Extract column name and literal value
-        const col_name = switch (eq_op.left.*) {
-            .column_ref => |cr| cr.column,
-            else => return null,
-        };
-
-        // Check if we have an index on this column
-        var idx_buf: [16]schema.Index = undefined;
-        const idx_count = self.schema_store.indexesForTable(table_entry.name, &idx_buf);
-        var matching_index: ?schema.Index = null;
-        for (idx_buf[0..idx_count]) |idx_entry| {
-            if (idx_entry.columns.len == 1 and std.mem.eql(u8, idx_entry.columns[0], col_name)) {
-                matching_index = idx_entry;
-                break;
-            }
-        }
-        const idx_entry = matching_index orelse return null;
-
-        // Serialize the search value to key bytes
-        const search_val = evalToRecordValue(eq_op.right) catch return null;
-        var key_buf: [256]u8 = undefined;
-        var key_len: usize = 0;
-        switch (search_val) {
-            .integer => |v| {
-                const unsigned: u64 = @bitCast(v);
-                const sortable = unsigned ^ (@as(u64, 1) << 63);
-                std.mem.writeInt(u64, key_buf[0..8], sortable, .big);
-                key_len = 8;
-            },
-            .text => |t| {
-                if (t.len > key_buf.len) return null;
-                @memcpy(key_buf[0..t.len], t);
-                key_len = t.len;
-            },
-            else => return null,
-        }
-
-        // Look up rowids in index
-        var idx_bt = btree.Btree.open(self.pool, idx_entry.root_page);
-        var rowid_buf: [1024]i64 = undefined;
-        const matching_rowids = idx_bt.indexSearch(key_buf[0..key_len], &rowid_buf) catch return null;
-
-        // Build column names
-        var col_names_list: std.ArrayList([]const u8) = .{};
-        var is_star = false;
-        var col_indices_list: std.ArrayList(?usize) = .{};
-
-        for (sel.columns) |col| {
-            switch (col) {
-                .all_columns, .table_all => {
-                    is_star = true;
-                    for (table_entry.columns) |cc| {
-                        col_names_list.append(arena, cc.name) catch return null;
-                    }
-                },
-                .expr => |ec| {
-                    col_names_list.append(arena, ec.alias orelse exprName(ec.expr)) catch return null;
-                    col_indices_list.append(arena, resolveColumnIndex(ec.expr, table_entry.columns)) catch return null;
-                },
-            }
-        }
-
-        // Fetch rows by rowid using targeted bt.search() per matching rowid
-        var rows_list: std.ArrayList(ResultRow) = .{};
-        for (matching_rowids) |rid| {
-            const cell_result = bt.search(rid) catch continue;
-            const entry = cell_result orelse continue;
-
-            if (is_star) {
-                const num_cols = table_entry.columns.len;
-                const vals = arena.alloc(Value, num_cols) catch return null;
-                // Use readColumn per column to avoid full deserialization
-                for (0..num_cols) |ci| {
-                    const rv = record.readColumn(entry.payload, ci) catch record.Value{ .null_val = {} };
-                    vals[ci] = recordToValue(rv);
-                }
-                rows_list.append(arena, .{ .values = vals }) catch return null;
-            } else {
-                const vals = arena.alloc(Value, col_indices_list.items.len) catch return null;
-                for (col_indices_list.items, 0..) |maybe_idx, i| {
-                    if (maybe_idx) |idx| {
-                        const rv = record.readColumn(entry.payload, idx) catch record.Value{ .null_val = {} };
-                        vals[i] = recordToValue(rv);
-                    } else {
-                        vals[i] = .{ .null_val = {} };
-                    }
-                }
-                rows_list.append(arena, .{ .values = vals }) catch return null;
-            }
-        }
-
-        return ExecResult{
-            .rows = rows_list.items,
-            .column_names = col_names_list.items,
-            .rows_affected = 0,
-            .message = null,
-        };
-    }
-
-    // ─── JOIN SELECT ─────────────────────────────────────────────────
-
-    /// Table context for multi-table join evaluation
-    const JoinTableCtx = struct {
-        name: []const u8, // table name or alias
-        columns: []const schema.Column,
-        values: []const record.Value, // current row decoded values
-    };
-
-    fn execJoinSelect(
-        self: *Self,
-        sel: ast.Statement.Select,
-        from: ast.TableRef,
-        arena: std.mem.Allocator,
-    ) ExecError!ExecResult {
-        // Resolve left (FROM) table
-        const left_table = self.schema_store.getTable(from.name) orelse
-            return ExecError.TableNotFound;
-        const left_alias = from.alias orelse from.name;
-
-        // Collect all join tables
-        var join_tables: [8]JoinInfo = undefined;
-        for (sel.joins, 0..) |jc, i| {
-            const jt = self.schema_store.getTable(jc.table.name) orelse
-                return ExecError.TableNotFound;
-            join_tables[i] = .{
-                .table = jt,
-                .alias = jc.table.alias orelse jc.table.name,
-                .join_type = jc.join_type,
-                .on_expr = jc.on,
-            };
-        }
-        const num_joins = sel.joins.len;
-
-        // Build output column list
-        var col_names_list: std.ArrayList([]const u8) = .{};
-        var is_star = false;
-        // For star: columns from left + all join tables
-        for (sel.columns) |col| {
-            switch (col) {
-                .all_columns => {
-                    is_star = true;
-                    for (left_table.columns) |cc| {
-                        col_names_list.append(arena, cc.name) catch return ExecError.StorageError;
-                    }
-                    for (0..num_joins) |ji| {
-                        for (join_tables[ji].table.columns) |cc| {
-                            col_names_list.append(arena, cc.name) catch return ExecError.StorageError;
-                        }
-                    }
-                },
-                .table_all => {
-                    is_star = true;
-                    for (left_table.columns) |cc| {
-                        col_names_list.append(arena, cc.name) catch return ExecError.StorageError;
-                    }
-                    for (0..num_joins) |ji| {
-                        for (join_tables[ji].table.columns) |cc| {
-                            col_names_list.append(arena, cc.name) catch return ExecError.StorageError;
-                        }
-                    }
-                },
-                .expr => |ec| {
-                    col_names_list.append(arena, ec.alias orelse exprName(ec.expr)) catch return ExecError.StorageError;
-                },
-            }
-        }
-
-        // Result rows
-        var rows_list: std.ArrayList(ResultRow) = .{};
-
-        // ── Pre-load both tables into memory ────────────────────
-        // Eliminates B-tree page reads and deserializations from inner loop.
-        if (num_joins == 1) {
-            const ji = join_tables[0];
-
-            const PreloadedRow = struct { values: []record.Value };
-
-            // Load tables — check table row cache first
-            var right_rows: std.ArrayList(PreloadedRow) = .{};
-            if (self.table_row_cache.get(ji.table.root_page)) |cached| {
-                if (cached.data_version == self.data_version) {
-                    // Cache hit — wrap cached rows as PreloadedRow
-                    for (cached.rows) |row| {
-                        right_rows.append(arena, .{ .values = row }) catch break;
-                    }
-                }
-            }
-            if (right_rows.items.len == 0) {
-                // Cache miss — load from B-tree
-                var right_bt = btree.Btree.open(self.pool, ji.table.root_page);
-                var right_cur = cursor.Cursor.init(&right_bt);
-                right_cur.first() catch {};
-                while (right_cur.valid) {
-                    const right_entry = right_cur.cell() catch break;
-                    const decoded = record.deserializeRecord(right_entry.payload, self.allocator) catch {
-                        _ = right_cur.next() catch {};
-                        continue;
-                    };
-                    right_rows.append(arena, .{ .values = decoded }) catch break;
-                    _ = right_cur.next() catch break;
-                }
-                // Store in table cache
-                const cached_rows = self.allocator.alloc([]record.Value, right_rows.items.len) catch null;
-                if (cached_rows) |cr| {
-                    for (right_rows.items, 0..) |row, i| cr[i] = row.values;
-                    self.table_row_cache.put(ji.table.root_page, .{
-                        .rows = cr,
-                        .schema_version = self.schema_version,
-                        .root_page = ji.table.root_page,
-                        .data_version = self.data_version,
-                    }) catch {};
-                }
-            }
-
-            var left_rows: std.ArrayList(PreloadedRow) = .{};
-            if (self.table_row_cache.get(left_table.root_page)) |cached| {
-                if (cached.data_version == self.data_version) {
-                    for (cached.rows) |row| {
-                        left_rows.append(arena, .{ .values = row }) catch break;
-                    }
-                }
-            }
-            if (left_rows.items.len == 0) {
-                var left_bt = btree.Btree.open(self.pool, left_table.root_page);
-                var left_cur = cursor.Cursor.init(&left_bt);
-                left_cur.first() catch {};
-                while (left_cur.valid) {
-                    const left_entry = left_cur.cell() catch break;
-                    const decoded = record.deserializeRecord(left_entry.payload, self.allocator) catch {
-                        _ = left_cur.next() catch {};
-                        continue;
-                    };
-                    left_rows.append(arena, .{ .values = decoded }) catch break;
-                    _ = left_cur.next() catch break;
-                }
-                const cached_rows = self.allocator.alloc([]record.Value, left_rows.items.len) catch null;
-                if (cached_rows) |cr| {
-                    for (left_rows.items, 0..) |row, i| cr[i] = row.values;
-                    self.table_row_cache.put(left_table.root_page, .{
-                        .rows = cr,
-                        .schema_version = self.schema_version,
-                        .root_page = left_table.root_page,
-                        .data_version = self.data_version,
-                    }) catch {};
-                }
-            }
-
-            const total_cols = left_table.columns.len + ji.table.columns.len;
-
-            // ── Pre-compute ON clause column indices ──────────────
-            // For simple ON equality (a.col = b.col), resolve column names
-            // to integer indices once, then use direct array indexing in the loop.
-            var left_on_idx: ?usize = null;
-            var right_on_idx: ?usize = null;
-            var use_fast_eq = false;
-
-            if (ji.on_expr) |on_expr| {
-                if (on_expr.* == .binary_op) {
-                    const bop = on_expr.binary_op;
-                    if (bop.op == .eq) {
-                        if (bop.left.* == .column_ref and bop.right.* == .column_ref) {
-                            const left_ref = bop.left.column_ref;
-                            const right_ref = bop.right.column_ref;
-
-                            // Resolve left column index
-                            if (left_ref.table) |tbl| {
-                                if (std.mem.eql(u8, tbl, left_alias)) {
-                                    for (left_table.columns, 0..) |col, ci| {
-                                        if (std.mem.eql(u8, col.name, left_ref.column)) { left_on_idx = ci; break; }
-                                    }
-                                } else if (std.mem.eql(u8, tbl, ji.alias)) {
-                                    for (ji.table.columns, 0..) |col, ci| {
-                                        if (std.mem.eql(u8, col.name, left_ref.column)) { right_on_idx = ci; break; }
-                                    }
-                                }
-                            }
-
-                            // Resolve right column index
-                            if (right_ref.table) |tbl| {
-                                if (std.mem.eql(u8, tbl, left_alias)) {
-                                    for (left_table.columns, 0..) |col, ci| {
-                                        if (std.mem.eql(u8, col.name, right_ref.column)) { left_on_idx = ci; break; }
-                                    }
-                                } else if (std.mem.eql(u8, tbl, ji.alias)) {
-                                    for (ji.table.columns, 0..) |col, ci| {
-                                        if (std.mem.eql(u8, col.name, right_ref.column)) { right_on_idx = ci; break; }
-                                    }
-                                }
-                            }
-
-                            if (left_on_idx != null and right_on_idx != null) {
-                                use_fast_eq = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // ── Hash join for integer equi-joins ─────────────────
-            if (use_fast_eq) {
-                // Build hash map: right join column value → list of row indices
-                const HashMapType = std.AutoHashMap(i64, std.ArrayList(usize));
-                var hash_map = HashMapType.init(arena);
-
-                for (right_rows.items, 0..) |right_row, ri| {
-                    if (right_on_idx.? < right_row.values.len) {
-                        const rv = right_row.values[right_on_idx.?];
-                        switch (rv) {
-                            .integer => |iv| {
-                                const gop = hash_map.getOrPut(iv) catch continue;
-                                if (!gop.found_existing) {
-                                    gop.value_ptr.* = .{};
-                                }
-                                gop.value_ptr.append(arena, ri) catch continue;
-                            },
-                            else => {},
-                        }
-                    }
-                }
-
-                // Pre-allocate batch buffer for result values (one big alloc)
-                const max_result_rows = left_rows.items.len * 2; // estimate: at most 2x left table
-                var vals_batch = arena.alloc(Value, max_result_rows * total_cols) catch
-                    return ExecError.StorageError;
-                var batch_idx: usize = 0;
-                var rows_buf: [256]ResultRow = undefined;
-                var row_count: usize = 0;
-
-                // Probe hash map for each left row
-                for (left_rows.items) |left_row| {
-                    var matched = false;
-                    const lv = if (left_on_idx.? < left_row.values.len) left_row.values[left_on_idx.?] else record.Value{ .null_val = {} };
-
-                    if (lv == .integer) {
-                        if (hash_map.get(lv.integer)) |indices| {
-                            matched = true;
-                            for (indices.items) |ri| {
-                                const right_row = right_rows.items[ri];
-                                if (is_star) {
-                                    // Slice from batch or fallback to arena
-                                    const vals = if (batch_idx + total_cols <= vals_batch.len)
-                                        blk: {
-                                            const s = vals_batch[batch_idx .. batch_idx + total_cols];
-                                            batch_idx += total_cols;
-                                            break :blk s;
-                                        }
-                                    else
-                                        arena.alloc(Value, total_cols) catch continue;
-
-                                    var vi: usize = 0;
-                                    for (0..left_table.columns.len) |ci| {
-                                        vals[vi] = if (ci < left_row.values.len) recordToValue(left_row.values[ci]) else .{ .null_val = {} };
-                                        vi += 1;
-                                    }
-                                    for (0..ji.table.columns.len) |ci| {
-                                        vals[vi] = if (ci < right_row.values.len) recordToValue(right_row.values[ci]) else .{ .null_val = {} };
-                                        vi += 1;
-                                    }
-                                    if (row_count < rows_buf.len) {
-                                        rows_buf[row_count] = .{ .values = vals };
-                                        row_count += 1;
-                                    } else {
-                                        rows_list.append(arena, .{ .values = vals }) catch continue;
-                                    }
-                                } else {
-                                    self.buildJoinResultRow(
-                                        sel, is_star, left_table, left_alias, left_row.values,
-                                        &[_]JoinInfo{ji}, &[_]?[]const record.Value{right_row.values},
-                                        arena, &rows_list,
-                                    ) catch continue;
-                                }
-                            }
-                        }
-                    }
-
-                    // LEFT JOIN: emit left row with NULLs if no match
-                    if (!matched and ji.join_type == .left) {
-                        if (is_star) {
-                            const vals = if (batch_idx + total_cols <= vals_batch.len)
-                                blk: {
-                                    const s = vals_batch[batch_idx .. batch_idx + total_cols];
-                                    batch_idx += total_cols;
-                                    break :blk s;
-                                }
-                            else
-                                arena.alloc(Value, total_cols) catch continue;
-                            var vi: usize = 0;
-                            for (0..left_table.columns.len) |ci| {
-                                vals[vi] = if (ci < left_row.values.len) recordToValue(left_row.values[ci]) else .{ .null_val = {} };
-                                vi += 1;
-                            }
-                            for (0..ji.table.columns.len) |_| {
-                                vals[vi] = .{ .null_val = {} };
-                                vi += 1;
-                            }
-                            if (row_count < rows_buf.len) {
-                                rows_buf[row_count] = .{ .values = vals };
-                                row_count += 1;
-                            } else {
-                                rows_list.append(arena, .{ .values = vals }) catch continue;
-                            }
-                        } else {
-                            self.buildJoinResultRow(
-                                sel, is_star, left_table, left_alias, left_row.values,
-                                &[_]JoinInfo{ji}, &[_]?[]const record.Value{null},
-                                arena, &rows_list,
-                            ) catch continue;
-                        }
-                    }
-                }
-
-                // Flush rows_buf into rows_list
-                if (row_count > 0) {
-                    rows_list.appendSlice(arena, rows_buf[0..row_count]) catch {};
-                }
-            } else {
-            // ── Nested loop join (fallback) ──────────────────────
-            for (left_rows.items) |left_row| {
-                var matched = false;
-
-                for (right_rows.items) |right_row| {
-                    var on_match: bool = true;
-                    if (ji.on_expr) |on_expr| {
-                        const tables = [_]JoinTableCtx{
-                            .{ .name = left_alias, .columns = left_table.columns, .values = left_row.values },
-                            .{ .name = ji.alias, .columns = ji.table.columns, .values = right_row.values },
-                        };
-                        on_match = evalExprMultiTable(on_expr, &tables) catch false;
-                    }
-
-                    if (on_match) {
-                        matched = true;
-                        if (is_star) {
-                            const vals = arena.alloc(Value, total_cols) catch continue;
-                            var vi: usize = 0;
-                            for (0..left_table.columns.len) |ci| {
-                                vals[vi] = if (ci < left_row.values.len) recordToValue(left_row.values[ci]) else .{ .null_val = {} };
-                                vi += 1;
-                            }
-                            for (0..ji.table.columns.len) |ci| {
-                                vals[vi] = if (ci < right_row.values.len) recordToValue(right_row.values[ci]) else .{ .null_val = {} };
-                                vi += 1;
-                            }
-                            rows_list.append(arena, .{ .values = vals }) catch continue;
-                        } else {
-                            self.buildJoinResultRow(
-                                sel, is_star, left_table, left_alias, left_row.values,
-                                &[_]JoinInfo{ji}, &[_]?[]const record.Value{right_row.values},
-                                arena, &rows_list,
-                            ) catch continue;
-                        }
-                    }
-                }
-
-                // LEFT JOIN: emit left row with NULLs if no match
-                if (!matched and ji.join_type == .left) {
-                    if (is_star) {
-                        const vals = arena.alloc(Value, total_cols) catch continue;
-                        var vi: usize = 0;
-                        for (0..left_table.columns.len) |ci| {
-                            vals[vi] = if (ci < left_row.values.len) recordToValue(left_row.values[ci]) else .{ .null_val = {} };
-                            vi += 1;
-                        }
-                        for (0..ji.table.columns.len) |_| {
-                            vals[vi] = .{ .null_val = {} };
-                            vi += 1;
-                        }
-                        rows_list.append(arena, .{ .values = vals }) catch continue;
-                    } else {
-                        self.buildJoinResultRow(
-                            sel, is_star, left_table, left_alias, left_row.values,
-                            &[_]JoinInfo{ji}, &[_]?[]const record.Value{null},
-                            arena, &rows_list,
-                        ) catch continue;
-                    }
-                }
-            }
-            } // end else (nested loop fallback)
-        }
-
-        return ExecResult{
-            .rows = rows_list.items,
-            .column_names = col_names_list.items,
-            .rows_affected = 0,
-            .message = null,
-        };
-    }
-
-    const JoinInfo = struct {
-        table: schema.Table,
-        alias: []const u8,
-        join_type: ast.JoinType,
-        on_expr: ?*ast.Expr,
-    };
-
-    fn buildJoinResultRow(
-        self: *Self,
-        sel: ast.Statement.Select,
-        is_star: bool,
-        left_table: schema.Table,
-        left_alias: []const u8,
-        left_vals: []const record.Value,
-        join_infos: []const JoinInfo,
-        right_vals_list: []const ?[]const record.Value,
-        arena: std.mem.Allocator,
-        rows_list: *std.ArrayList(ResultRow),
-    ) ExecError!void {
-        _ = self;
-        if (is_star) {
-            // Count total columns
-            var total_cols = left_table.columns.len;
-            for (join_infos) |ji| total_cols += ji.table.columns.len;
-
-            const vals = arena.alloc(Value, total_cols) catch return ExecError.StorageError;
-            var vi: usize = 0;
-
-            // Left table values
-            for (0..left_table.columns.len) |i| {
-                vals[vi] = if (i < left_vals.len) recordToValue(left_vals[i]) else .{ .null_val = {} };
-                vi += 1;
-            }
-
-            // Right table values (or NULLs for LEFT JOIN)
-            for (join_infos, 0..) |ji, ji_idx| {
-                if (right_vals_list[ji_idx]) |rv| {
-                    for (0..ji.table.columns.len) |i| {
-                        vals[vi] = if (i < rv.len) recordToValue(rv[i]) else .{ .null_val = {} };
-                        vi += 1;
-                    }
-                } else {
-                    for (0..ji.table.columns.len) |_| {
-                        vals[vi] = .{ .null_val = {} };
-                        vi += 1;
-                    }
-                }
-            }
-
-            rows_list.append(arena, .{ .values = vals }) catch return ExecError.StorageError;
-        } else {
-            // Resolve specific columns
-            var tables_buf: [8]JoinTableCtx = undefined;
-            tables_buf[0] = .{ .name = left_alias, .columns = left_table.columns, .values = left_vals };
-            for (join_infos, 0..) |ji, ji_idx| {
-                if (right_vals_list[ji_idx]) |rv| {
-                    tables_buf[1 + ji_idx] = .{ .name = ji.alias, .columns = ji.table.columns, .values = rv };
-                } else {
-                    // LEFT JOIN null row
-                    tables_buf[1 + ji_idx] = .{ .name = ji.alias, .columns = ji.table.columns, .values = &.{} };
-                }
-            }
-            const tables = tables_buf[0 .. 1 + join_infos.len];
-
-            var expr_cols: std.ArrayList(Value) = .{};
-            for (sel.columns) |col| {
-                switch (col) {
-                    .all_columns, .table_all => {}, // handled by is_star
-                    .expr => |ec| {
-                        const val = resolveValueMultiTable(ec.expr, tables) catch record.Value{ .null_val = {} };
-                        expr_cols.append(arena, recordToValue(val)) catch return ExecError.StorageError;
-                    },
-                }
-            }
-            const vals = arena.dupe(Value, expr_cols.items) catch return ExecError.StorageError;
-            rows_list.append(arena, .{ .values = vals }) catch return ExecError.StorageError;
-        }
-    }
 
     // ─── DELETE ──────────────────────────────────────────────────────
 
@@ -1926,164 +1102,7 @@ fn evalWhere(expr: *ast.Expr, columns: []const schema.Column, row: []const recor
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Compiled WHERE — pre-resolve column indices once, avoid per-row string cmp
-// ═══════════════════════════════════════════════════════════════════════════
 
-const WhereCompiled = struct {
-    kind: Kind,
-
-    const Kind = union(enum) {
-        simple: Simple,
-        compound_and: Compound,
-        compound_or: Compound,
-        not_compiled: void, // fallback to evalWhereLazy
-    };
-
-    const Simple = struct {
-        col_idx: usize,
-        literal: record.Value,
-        op: ast.BinOp,
-    };
-
-    const Compound = struct {
-        parts: [4]?*const WhereCompiled,
-        count: usize,
-    };
-};
-
-fn compileSimpleWhere(expr: *ast.Expr, columns: []const schema.Column, arena: std.mem.Allocator) WhereCompiled {
-    switch (expr.*) {
-        .binary_op => |bop| {
-            switch (bop.op) {
-                .eq, .ne, .lt, .gt, .le, .ge => {
-                    // Try: column op literal/placeholder
-                    if (bop.left.* == .column_ref) {
-                        const col_name = bop.left.column_ref.column;
-                        for (columns, 0..) |col, i| {
-                            if (std.mem.eql(u8, col.name, col_name)) {
-                                const lit = resolveLiteralValue(bop.right) orelse
-                                    return .{ .kind = .{ .not_compiled = {} } };
-                                return .{ .kind = .{ .simple = .{
-                                    .col_idx = i,
-                                    .literal = lit,
-                                    .op = bop.op,
-                                } } };
-                            }
-                        }
-                    }
-                    // Try: literal op column (reversed)
-                    if (bop.right.* == .column_ref) {
-                        const col_name = bop.right.column_ref.column;
-                        for (columns, 0..) |col, i| {
-                            if (std.mem.eql(u8, col.name, col_name)) {
-                                const lit = resolveLiteralValue(bop.left) orelse
-                                    return .{ .kind = .{ .not_compiled = {} } };
-                                // Reverse the operator
-                                const rev_op: ast.BinOp = switch (bop.op) {
-                                    .lt => .gt,
-                                    .gt => .lt,
-                                    .le => .ge,
-                                    .ge => .le,
-                                    else => bop.op, // eq, ne are symmetric
-                                };
-                                return .{ .kind = .{ .simple = .{
-                                    .col_idx = i,
-                                    .literal = lit,
-                                    .op = rev_op,
-                                } } };
-                            }
-                        }
-                    }
-                    return .{ .kind = .{ .not_compiled = {} } };
-                },
-                .@"and", .@"or" => {
-                    const left_c = arena.create(WhereCompiled) catch return .{ .kind = .{ .not_compiled = {} } };
-                    left_c.* = compileSimpleWhere(bop.left, columns, arena);
-                    const right_c = arena.create(WhereCompiled) catch return .{ .kind = .{ .not_compiled = {} } };
-                    right_c.* = compileSimpleWhere(bop.right, columns, arena);
-
-                    var parts = [_]?*const WhereCompiled{null} ** 4;
-                    parts[0] = left_c;
-                    parts[1] = right_c;
-
-                    if (bop.op == .@"and") {
-                        return .{ .kind = .{ .compound_and = .{ .parts = parts, .count = 2 } } };
-                    } else {
-                        return .{ .kind = .{ .compound_or = .{ .parts = parts, .count = 2 } } };
-                    }
-                },
-                else => return .{ .kind = .{ .not_compiled = {} } },
-            }
-        },
-        .paren => |inner| return compileSimpleWhere(inner, columns, arena),
-        else => return .{ .kind = .{ .not_compiled = {} } },
-    }
-}
-
-/// Resolve a literal or placeholder value from an expression (no column refs).
-fn resolveLiteralValue(expr: *ast.Expr) ?record.Value {
-    return switch (expr.*) {
-        .integer_literal => |v| .{ .integer = v },
-        .real_literal => |v| .{ .real = v },
-        .string_literal => |v| .{ .text = v },
-        .null_literal => .{ .null_val = {} },
-        .placeholder => |idx| {
-            if (current_bound_params) |params| {
-                if (idx >= 1 and idx <= params.len) return params[idx - 1];
-            }
-            return null;
-        },
-        .unary_op => |op| {
-            if (op.op == .negate) {
-                const inner = resolveLiteralValue(op.operand) orelse return null;
-                return switch (inner) {
-                    .integer => |v| record.Value{ .integer = -v },
-                    .real => |v| record.Value{ .real = -v },
-                    else => null,
-                };
-            }
-            return null;
-        },
-        .paren => |inner| resolveLiteralValue(inner),
-        else => null,
-    };
-}
-
-/// Fast WHERE evaluation using pre-compiled column indices.
-fn evalWhereCompiled(compiled: *const WhereCompiled, columns: []const schema.Column, payload: []const u8) !bool {
-    switch (compiled.kind) {
-        .simple => |s| {
-            const col_val = record.readColumn(payload, s.col_idx) catch return false;
-            return switch (s.op) {
-                .eq => valuesEqual(col_val, s.literal),
-                .ne => !valuesEqual(col_val, s.literal),
-                .lt => valueLess(col_val, s.literal),
-                .gt => valueLess(s.literal, col_val),
-                .le => valuesEqual(col_val, s.literal) or valueLess(col_val, s.literal),
-                .ge => valuesEqual(col_val, s.literal) or valueLess(s.literal, col_val),
-                else => error.TypeError,
-            };
-        },
-        .compound_and => |c| {
-            for (c.parts[0..c.count]) |maybe_part| {
-                const part = maybe_part orelse continue;
-                if (part.kind == .not_compiled) return error.TypeError;
-                if (!try evalWhereCompiled(part, columns, payload)) return false;
-            }
-            return true;
-        },
-        .compound_or => |c| {
-            for (c.parts[0..c.count]) |maybe_part| {
-                const part = maybe_part orelse continue;
-                if (part.kind == .not_compiled) return error.TypeError;
-                if (try evalWhereCompiled(part, columns, payload)) return true;
-            }
-            return false;
-        },
-        .not_compiled => return error.TypeError,
-    }
-}
 
 /// Lazy WHERE evaluation: uses record.readColumn() to only decode referenced columns.
 /// No allocation needed — zero-copy from the raw record buffer.

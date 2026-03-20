@@ -16,13 +16,11 @@ test "integration: SELECT constant expression" {
 
     var vm_inst = try zqlite.vm.VM.init(std.testing.allocator, program);
     defer vm_inst.deinit();
-    try vm_inst.execute();
-
-    try std.testing.expectEqual(@as(usize, 1), vm_inst.results.items.len);
-    // 1 + 2 * 3 => with left-to-right parsing: (1 + 2) * 3 = 9 or
-    // with proper precedence: 1 + (2 * 3) = 7
-    const val = vm_inst.results.items[0].values[0].integer;
+    try std.testing.expectEqual(zqlite.vm.StepResult.row, try vm_inst.step());
+    const start: usize = @intCast(vm_inst.program.instructions[vm_inst.pc - 1].p1);
+    const val = vm_inst.registers[start].integer;
     try std.testing.expectEqual(@as(i64, 7), val);
+    try std.testing.expectEqual(zqlite.vm.StepResult.done, try vm_inst.step());
 }
 
 test "integration: SELECT string literal" {
@@ -38,9 +36,10 @@ test "integration: SELECT string literal" {
 
     var vm_inst = try zqlite.vm.VM.init(std.testing.allocator, program);
     defer vm_inst.deinit();
-    try vm_inst.execute();
-
-    try std.testing.expectEqualStrings("hello world", vm_inst.results.items[0].values[0].text);
+    try std.testing.expectEqual(zqlite.vm.StepResult.row, try vm_inst.step());
+    const start: usize = @intCast(vm_inst.program.instructions[vm_inst.pc - 1].p1);
+    try std.testing.expectEqualStrings("hello world", vm_inst.registers[start].text);
+    try std.testing.expectEqual(zqlite.vm.StepResult.done, try vm_inst.step());
 }
 
 test "integration: SELECT multiple expressions" {
@@ -56,12 +55,19 @@ test "integration: SELECT multiple expressions" {
 
     var vm_inst = try zqlite.vm.VM.init(std.testing.allocator, program);
     defer vm_inst.deinit();
-    try vm_inst.execute();
 
-    const row = vm_inst.results.items[0];
-    try std.testing.expectEqual(@as(i64, 42), row.values[0].integer);
-    try std.testing.expectEqualStrings("zqlite", row.values[1].text);
-    try std.testing.expectEqual(@as(i64, 2), row.values[2].integer);
+    std.debug.print("INSTRUCTIONS:\n", .{});
+    for (program.instructions) |ins| {
+        std.debug.print("{} {} {} {}\n", .{ins.opcode, ins.p1, ins.p2, ins.p3});
+    }
+
+    try std.testing.expectEqual(zqlite.vm.StepResult.row, try vm_inst.step());
+    const start: usize = @intCast(vm_inst.program.instructions[vm_inst.pc - 1].p1);
+    std.debug.print("start: {d}\n", .{start});
+    try std.testing.expectEqual(@as(i64, 42), vm_inst.registers[start].integer);
+    try std.testing.expectEqualStrings("zqlite", vm_inst.registers[start + 1].text);
+    try std.testing.expectEqual(@as(i64, 2), vm_inst.registers[start + 2].integer);
+    try std.testing.expectEqual(zqlite.vm.StepResult.done, try vm_inst.step());
 }
 
 test "integration: SELECT with negation" {
@@ -77,9 +83,10 @@ test "integration: SELECT with negation" {
 
     var vm_inst = try zqlite.vm.VM.init(std.testing.allocator, program);
     defer vm_inst.deinit();
-    try vm_inst.execute();
-
-    try std.testing.expectEqual(@as(i64, -42), vm_inst.results.items[0].values[0].integer);
+    try std.testing.expectEqual(zqlite.vm.StepResult.row, try vm_inst.step());
+    const start: usize = @intCast(vm_inst.program.instructions[vm_inst.pc - 1].p1);
+    try std.testing.expectEqual(@as(i64, -42), vm_inst.registers[start].integer);
+    try std.testing.expectEqual(zqlite.vm.StepResult.done, try vm_inst.step());
 }
 
 test "integration: btree + record round-trip" {
