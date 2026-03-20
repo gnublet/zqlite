@@ -194,6 +194,51 @@ pub const Schema = struct {
             }
         }
 
+        // ── Serialize indexes ────────────────────────────────────────
+        // index_count: u32
+        var idx_count: u32 = 0;
+        var idx_it = self.indexes.iterator();
+        while (idx_it.next()) |_| idx_count += 1;
+        if (pos + 4 <= page_buf.len) {
+            std.mem.writeInt(u32, page_buf[pos..][0..4], idx_count, .little);
+            pos += 4;
+        }
+
+        var idx_it2 = self.indexes.iterator();
+        while (idx_it2.next()) |entry| {
+            const idx = entry.value_ptr.*;
+            // name
+            if (pos + 2 + idx.name.len >= page_buf.len) break;
+            std.mem.writeInt(u16, page_buf[pos..][0..2], @intCast(idx.name.len), .little);
+            pos += 2;
+            @memcpy(page_buf[pos..][0..idx.name.len], idx.name);
+            pos += idx.name.len;
+
+            // table_name
+            if (pos + 2 + idx.table_name.len + 4 + 1 + 2 >= page_buf.len) break;
+            std.mem.writeInt(u16, page_buf[pos..][0..2], @intCast(idx.table_name.len), .little);
+            pos += 2;
+            @memcpy(page_buf[pos..][0..idx.table_name.len], idx.table_name);
+            pos += idx.table_name.len;
+
+            // root_page, is_unique, col_count
+            std.mem.writeInt(u32, page_buf[pos..][0..4], idx.root_page, .little);
+            pos += 4;
+            page_buf[pos] = if (idx.is_unique) 1 else 0;
+            pos += 1;
+            std.mem.writeInt(u16, page_buf[pos..][0..2], @intCast(idx.columns.len), .little);
+            pos += 2;
+
+            // columns
+            for (idx.columns) |col_name| {
+                if (pos + 2 + col_name.len >= page_buf.len) break;
+                std.mem.writeInt(u16, page_buf[pos..][0..2], @intCast(col_name.len), .little);
+                pos += 2;
+                @memcpy(page_buf[pos..][0..col_name.len], col_name);
+                pos += col_name.len;
+            }
+        }
+
         // Zero-fill remainder
         @memset(page_buf[pos..], 0);
     }
@@ -274,6 +319,55 @@ pub const Schema = struct {
                 .next_rowid = next_rowid,
                 .has_rowid_alias = has_rowid_alias,
                 .rowid_alias_col = rowid_alias_col,
+            }) catch return false;
+        }
+
+        // ── Deserialize indexes ──────────────────────────────────────
+        if (pos + 4 > page_buf.len) return true; // no indexes section
+        const idx_count = std.mem.readInt(u32, page_buf[pos..][0..4], .little);
+        pos += 4;
+
+        var ii: u32 = 0;
+        while (ii < idx_count) : (ii += 1) {
+            if (pos + 2 > page_buf.len) return false;
+            const idx_name_len = std.mem.readInt(u16, page_buf[pos..][0..2], .little);
+            pos += 2;
+            if (pos + idx_name_len > page_buf.len) return false;
+            const idx_name = self.allocator.dupe(u8, page_buf[pos..][0..idx_name_len]) catch return false;
+            pos += idx_name_len;
+
+            if (pos + 2 > page_buf.len) return false;
+            const tbl_name_len = std.mem.readInt(u16, page_buf[pos..][0..2], .little);
+            pos += 2;
+            if (pos + tbl_name_len > page_buf.len) return false;
+            const tbl_name = self.allocator.dupe(u8, page_buf[pos..][0..tbl_name_len]) catch return false;
+            pos += tbl_name_len;
+
+            if (pos + 7 > page_buf.len) return false;
+            const idx_root = std.mem.readInt(u32, page_buf[pos..][0..4], .little);
+            pos += 4;
+            const is_unique = page_buf[pos] == 1;
+            pos += 1;
+            const col_count = std.mem.readInt(u16, page_buf[pos..][0..2], .little);
+            pos += 2;
+
+            const idx_cols = self.allocator.alloc([]const u8, col_count) catch return false;
+            var ci: u16 = 0;
+            while (ci < col_count) : (ci += 1) {
+                if (pos + 2 > page_buf.len) return false;
+                const cname_len = std.mem.readInt(u16, page_buf[pos..][0..2], .little);
+                pos += 2;
+                if (pos + cname_len > page_buf.len) return false;
+                idx_cols[ci] = self.allocator.dupe(u8, page_buf[pos..][0..cname_len]) catch return false;
+                pos += cname_len;
+            }
+
+            self.addIndex(.{
+                .name = idx_name,
+                .table_name = tbl_name,
+                .columns = idx_cols,
+                .root_page = idx_root,
+                .is_unique = is_unique,
             }) catch return false;
         }
 

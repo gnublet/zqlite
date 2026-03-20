@@ -31,6 +31,7 @@ pub const Parser = struct {
     tok: tokenizer.Tokenizer,
     current: tokenizer.Token,
     arena: std.mem.Allocator,
+    param_count: u32,
 
     const Self = @This();
 
@@ -41,6 +42,7 @@ pub const Parser = struct {
             .tok = t,
             .current = first,
             .arena = arena,
+            .param_count = 0,
         };
     }
 
@@ -633,6 +635,12 @@ pub const Parser = struct {
             },
             .kw_null => {
                 expr.* = .{ .null_literal = {} };
+                self.advance();
+                return expr;
+            },
+            .question_mark => {
+                self.param_count += 1;
+                expr.* = .{ .placeholder = self.param_count };
                 self.advance();
                 return expr;
             },

@@ -286,6 +286,189 @@ pub const BtreePage = struct {
         return null;
     }
 
+    // ─── Index leaf cell operations ─────────────────────────────────
+
+    /// Index leaf cell format: [payload_size: varint][key_bytes][rowid: varint]
+    /// key_bytes is the raw serialized column value (from record.serializeValue).
+    /// Cells are ordered by (key_bytes lexicographic, then rowid ascending).
+
+    /// Compare two index keys: first by key bytes, then by rowid as tiebreaker.
+    fn compareIndexKeys(key_a: []const u8, rowid_a: i64, key_b: []const u8, rowid_b: i64) std.math.Order {
+        const key_order = std.mem.order(u8, key_a, key_b);
+        if (key_order != .eq) return key_order;
+        return std.math.order(rowid_a, rowid_b);
+    }
+
+    /// Read the key_bytes and rowid from an index leaf cell at `cell_offset`.
+    pub fn readIndexCell(self: *const Self, cell_offset: u16) BtreeError!struct { key: []const u8, rowid: i64 } {
+        const data = self.page.data;
+        const off: usize = cell_offset;
+
+        // payload_size varint
+        const ps_info = record.getVarint(data[off..]) catch return BtreeError.CorruptPage;
+        const payload_size: usize = @intCast(ps_info.value);
+
+        // payload = key_bytes ++ rowid_varint
+        // We need to find where key ends and rowid begins.
+        // Rowid is the last varint in the payload.
+        const payload_start = off + ps_info.bytes;
+        const payload_end = payload_start + payload_size;
+
+        // Read rowid from the end of payload — scan forward to find it
+        // The key_bytes length = payload_size - rowid_varint_len
+        // We need to decode the payload to find the rowid boundary.
+        // Strategy: the rowid varint is at the end. Scan from payload_start
+        // consuming varints until we reach payload_end. The last varint is the rowid.
+        var pos = payload_start;
+        var last_varint_start = pos;
+        var last_varint_value: u64 = 0;
+        while (pos < payload_end) {
+            last_varint_start = pos;
+            const vi = record.getVarint(data[pos..]) catch return BtreeError.CorruptPage;
+            last_varint_value = vi.value;
+            pos += vi.bytes;
+        }
+
+        const key_bytes = data[payload_start..last_varint_start];
+        const rowid: i64 = @bitCast(last_varint_value);
+
+        return .{ .key = key_bytes, .rowid = rowid };
+    }
+
+    /// Insert an index leaf cell: [payload_size: varint][key_bytes][rowid: varint]
+    pub fn insertIndexLeafCell(self: *Self, key_bytes: []const u8, rowid: i64) BtreeError!void {
+        // Build cell: payload_size varint + key_bytes + rowid varint
+        var cell_buf: [4096]u8 = undefined;
+
+        // First compute the rowid varint
+        var rowid_buf: [10]u8 = undefined;
+        const rowid_len = record.putVarint(&rowid_buf, @bitCast(rowid)) catch return BtreeError.Overflow;
+
+        const payload_size = key_bytes.len + rowid_len;
+        var pos: usize = 0;
+
+        // payload_size varint
+        const ps_len = record.putVarint(&cell_buf, @intCast(payload_size)) catch return BtreeError.Overflow;
+        pos += ps_len;
+
+        // key bytes
+        if (pos + key_bytes.len > cell_buf.len) return BtreeError.Overflow;
+        @memcpy(cell_buf[pos..][0..key_bytes.len], key_bytes);
+        pos += key_bytes.len;
+
+        // rowid varint
+        @memcpy(cell_buf[pos..][0..rowid_len], rowid_buf[0..rowid_len]);
+        pos += rowid_len;
+
+        const cell_size: u16 = @intCast(pos);
+
+        // Find insertion point (binary search by key_bytes, then rowid)
+        const count = self.cellCount();
+        var insert_idx: u16 = count;
+
+        if (count > 0) {
+            var lo: u16 = 0;
+            var hi: u16 = count;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const mid_cell = self.readIndexCell(self.cellPointer(mid)) catch return BtreeError.CorruptPage;
+                const cmp = compareIndexKeys(mid_cell.key, mid_cell.rowid, key_bytes, rowid);
+                switch (cmp) {
+                    .lt => lo = mid + 1,
+                    .gt => hi = mid,
+                    .eq => return BtreeError.DuplicateKey,
+                }
+            }
+            insert_idx = lo;
+        }
+
+        // Check space
+        const cell_content_start = self.cellContentOffset();
+        const ptr_array_end = self.headerSize() + (count + 1) * 2;
+        const new_content_start = cell_content_start - cell_size;
+        if (new_content_start < ptr_array_end) return BtreeError.PageFull;
+
+        // Write cell
+        @memcpy(self.page.data[new_content_start..cell_content_start], cell_buf[0..cell_size]);
+
+        // Shift pointers
+        var i = count;
+        while (i > insert_idx) : (i -= 1) {
+            self.setCellPointer(i, self.cellPointer(i - 1));
+        }
+        self.setCellPointer(insert_idx, new_content_start);
+        self.setCellCount(count + 1);
+        self.setCellContentOffset(new_content_start);
+        if (self.pool) |p| p.markPageDirty(self.page) else self.page.markDirty();
+    }
+
+    /// Search index leaf for all rowids matching `key_bytes`.
+    /// Returns a slice of rowids from the provided buffer.
+    pub fn searchIndexLeaf(self: *const Self, key_bytes: []const u8, rowid_buf: []i64) BtreeError![]i64 {
+        const count = self.cellCount();
+        if (count == 0) return rowid_buf[0..0];
+
+        // Binary search for first cell with matching key
+        var lo: u16 = 0;
+        var hi: u16 = count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const mid_cell = self.readIndexCell(self.cellPointer(mid)) catch return BtreeError.CorruptPage;
+            const cmp = std.mem.order(u8, mid_cell.key, key_bytes);
+            switch (cmp) {
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+                .eq => {
+                    // Found a match — scan backward to find first
+                    hi = mid;
+                    // continue narrowing
+                },
+            }
+        }
+
+        // lo now points at the first cell >= key_bytes
+        var found: usize = 0;
+        var idx = lo;
+        while (idx < count and found < rowid_buf.len) : (idx += 1) {
+            const cell = self.readIndexCell(self.cellPointer(idx)) catch break;
+            if (!std.mem.eql(u8, cell.key, key_bytes)) break;
+            rowid_buf[found] = cell.rowid;
+            found += 1;
+        }
+
+        return rowid_buf[0..found];
+    }
+
+    /// Delete an index leaf cell matching (key_bytes, rowid).
+    pub fn deleteIndexLeafCell(self: *Self, key_bytes: []const u8, rowid: i64) BtreeError!void {
+        const count = self.cellCount();
+        if (count == 0) return BtreeError.KeyNotFound;
+
+        // Binary search
+        var lo: u16 = 0;
+        var hi: u16 = count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const mid_cell = self.readIndexCell(self.cellPointer(mid)) catch return BtreeError.CorruptPage;
+            const cmp = compareIndexKeys(mid_cell.key, mid_cell.rowid, key_bytes, rowid);
+            switch (cmp) {
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+                .eq => {
+                    // Found — remove by shifting pointers left
+                    var i = mid;
+                    while (i < count - 1) : (i += 1) {
+                        self.setCellPointer(i, self.cellPointer(i + 1));
+                    }
+                    self.setCellCount(count - 1);
+                    if (self.pool) |p| p.markPageDirty(self.page) else self.page.markDirty();
+                    return;
+                },
+            }
+        }
+        return BtreeError.KeyNotFound;
+    }
+
     /// Calculate free space on this page.
     pub fn freeSpace(self: *const Self) u16 {
         const ptr_array_end = self.headerSize() + self.cellCount() * 2;
@@ -754,6 +937,37 @@ pub const Btree = struct {
             // Interior: descend
             page_id = try self.findChildPage(&bp, rowid);
         }
+    }
+
+    // ─── Index B-tree operations ────────────────────────────────────
+
+    /// Insert an entry into an index B-tree (single-page for now).
+    /// key_bytes: serialized column value, rowid: the table row's rowid.
+    pub fn indexInsert(self: *Self, key_bytes: []const u8, rowid: i64) BtreeError!void {
+        const page = self.pool.fetchPage(self.root_page_id) catch return BtreeError.PagerError;
+        defer self.pool.releasePage(page);
+
+        var bp = BtreePage{ .page = page, .page_size = self.page_size, .pool = self.pool };
+        try bp.insertIndexLeafCell(key_bytes, rowid);
+    }
+
+    /// Search an index B-tree for all rowids matching key_bytes.
+    /// Returns a slice of rowids from the provided buffer.
+    pub fn indexSearch(self: *Self, key_bytes: []const u8, rowid_buf: []i64) BtreeError![]i64 {
+        const page = self.pool.fetchPage(self.root_page_id) catch return BtreeError.PagerError;
+        defer self.pool.releasePage(page);
+
+        const bp = BtreePage{ .page = page, .page_size = self.page_size, .pool = self.pool };
+        return bp.searchIndexLeaf(key_bytes, rowid_buf);
+    }
+
+    /// Delete an entry from an index B-tree.
+    pub fn indexDelete(self: *Self, key_bytes: []const u8, rowid: i64) BtreeError!void {
+        const page = self.pool.fetchPage(self.root_page_id) catch return BtreeError.PagerError;
+        defer self.pool.releasePage(page);
+
+        var bp = BtreePage{ .page = page, .page_size = self.page_size, .pool = self.pool };
+        try bp.deleteIndexLeafCell(key_bytes, rowid);
     }
 };
 

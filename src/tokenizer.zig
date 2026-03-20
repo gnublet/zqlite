@@ -102,6 +102,7 @@ pub const TokenType = enum {
     dot,
 
     // Special
+    question_mark, // ? placeholder
     eof,
     invalid,
 };
@@ -228,6 +229,7 @@ pub const Tokenizer = struct {
             '*' => return self.makeTokenAt(.star, self.source[start .. start + 1], start_line, start_col),
             '/' => return self.makeTokenAt(.slash, self.source[start .. start + 1], start_line, start_col),
             '%' => return self.makeTokenAt(.percent, self.source[start .. start + 1], start_line, start_col),
+            '?' => return self.makeTokenAt(.question_mark, self.source[start .. start + 1], start_line, start_col),
             '=' => return self.makeTokenAt(.eq, self.source[start .. start + 1], start_line, start_col),
             '<' => {
                 if (self.peek() == '=') {

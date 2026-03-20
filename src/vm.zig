@@ -1,5 +1,8 @@
 const std = @import("std");
 const record = @import("record.zig");
+const btree = @import("btree.zig");
+const cursor_mod = @import("cursor.zig");
+const pager = @import("pager.zig");
 
 /// Register-based Virtual Machine for ZQLite.
 ///
@@ -170,12 +173,31 @@ pub const Register = union(enum) {
     }
 };
 
+/// Convert record.Value → Register
+fn recordValueToRegister(rv: record.Value) Register {
+    return switch (rv) {
+        .null_val => .{ .null_val = {} },
+        .integer => |v| .{ .integer = v },
+        .real => |v| .{ .real = v },
+        .text => |v| .{ .text = v },
+        .blob => |v| .{ .blob = v },
+    };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // VM — the execution engine
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const ResultRow = struct {
     values: []Register,
+};
+
+/// B-tree cursor state for open_read/open_write opcodes
+const CursorState = struct {
+    bt: btree.Btree,
+    cur: cursor_mod.Cursor,
+    valid: bool,
+    is_write: bool,
 };
 
 pub const VM = struct {
@@ -185,6 +207,10 @@ pub const VM = struct {
     results: std.ArrayList(ResultRow),
     allocator: std.mem.Allocator,
     halted: bool,
+    pool: ?*pager.BufferPool,
+    cursors: [8]?CursorState,
+    bound_params: ?[]const record.Value,
+    rows_affected: usize,
 
     const Self = @This();
 
@@ -200,6 +226,10 @@ pub const VM = struct {
             .results = .{},
             .allocator = allocator,
             .halted = false,
+            .pool = null,
+            .cursors = .{null} ** 8,
+            .bound_params = null,
+            .rows_affected = 0,
         };
     }
 
@@ -320,10 +350,155 @@ pub const VM = struct {
                 self.registers[dst] = self.registers[src];
             },
 
-            // Stubs for operations that integrate with B-tree/pager
-            .open_read, .open_write, .close_cursor, .rewind, .next_row, .prev_row, .column, .rowid, .make_record, .insert, .delete, .idx_insert, .idx_search, .agg_step, .agg_final, .sorter_open, .sorter_insert, .sorter_sort, .sorter_data, .sorter_next, .transaction, .commit, .rollback, .move, .concat, .like, .blob, .compare => {
-                // Will be implemented as we integrate with the storage engine
+            // ── B-tree cursor operations ──────────────────────────────
+
+            .open_read => {
+                // p1 = cursor_id, p2 = root_page
+                const cid: usize = @intCast(instr.p1);
+                if (self.pool) |pool| {
+                    var bt = btree.Btree.open(pool, @intCast(instr.p2));
+                    var cur = cursor_mod.Cursor.init(&bt);
+                    cur.first() catch {};
+                    self.cursors[cid] = .{
+                        .bt = bt,
+                        .cur = cur,
+                        .valid = cur.valid,
+                        .is_write = false,
+                    };
+                }
             },
+            .open_write => {
+                // p1 = cursor_id, p2 = root_page
+                const cid: usize = @intCast(instr.p1);
+                if (self.pool) |pool| {
+                    const bt = btree.Btree.open(pool, @intCast(instr.p2));
+                    self.cursors[cid] = .{
+                        .bt = bt,
+                        .cur = undefined,
+                        .valid = true,
+                        .is_write = true,
+                    };
+                }
+            },
+            .rewind => {
+                // p1 = cursor_id, p2 = jump_target (if table is empty)
+                const cid: usize = @intCast(instr.p1);
+                if (self.cursors[cid]) |*cs| {
+                    cs.cur = cursor_mod.Cursor.init(&cs.bt);
+                    cs.cur.first() catch {
+                        cs.valid = false;
+                    };
+                    cs.valid = cs.cur.valid;
+                    if (!cs.valid) {
+                        self.pc = @intCast(instr.p2); // jump to HALT
+                    }
+                } else {
+                    self.pc = @intCast(instr.p2);
+                }
+            },
+            .next_row => {
+                // p1 = cursor_id, p2 = jump_target (loop back)
+                const cid: usize = @intCast(instr.p1);
+                if (self.cursors[cid]) |*cs| {
+                    _ = cs.cur.next() catch {};
+                    cs.valid = cs.cur.valid;
+                    if (cs.valid) {
+                        self.pc = @intCast(instr.p2); // loop back
+                    }
+                }
+            },
+            .column => {
+                // p1 = cursor_id, p2 = col_idx, p3 = dest_reg
+                const cid: usize = @intCast(instr.p1);
+                const col_idx: usize = @intCast(instr.p2);
+                const dst: usize = @intCast(instr.p3);
+                if (self.cursors[cid]) |*cs| {
+                    if (cs.valid) {
+                        const entry = cs.cur.cell() catch {
+                            self.registers[dst] = .{ .null_val = {} };
+                            return;
+                        };
+                        const rv = record.readColumn(entry.payload, col_idx) catch record.Value{ .null_val = {} };
+                        self.registers[dst] = recordValueToRegister(rv);
+                    } else {
+                        self.registers[dst] = .{ .null_val = {} };
+                    }
+                }
+            },
+            .rowid => {
+                // p1 = cursor_id, p2 = dest_reg
+                const cid: usize = @intCast(instr.p1);
+                const dst: usize = @intCast(instr.p2);
+                if (self.cursors[cid]) |*cs| {
+                    if (cs.valid) {
+                        const entry = cs.cur.cell() catch {
+                            self.registers[dst] = .{ .null_val = {} };
+                            return;
+                        };
+                        self.registers[dst] = .{ .integer = entry.key };
+                    }
+                }
+            },
+            .close_cursor => {
+                const cid: usize = @intCast(instr.p1);
+                self.cursors[cid] = null;
+            },
+            .make_record => {
+                // p1 = start_reg, p2 = num_fields, p3 = dest_reg
+                // Serialize registers into a record buffer
+                const start: usize = @intCast(instr.p1);
+                const count: usize = @intCast(instr.p2);
+                const dst: usize = @intCast(instr.p3);
+                var rec_vals: [64]record.Value = undefined;
+                for (0..count) |i| {
+                    rec_vals[i] = self.registers[start + i].toRecordValue();
+                }
+                var buf: [4096]u8 = undefined;
+                const size = record.serializeRecord(rec_vals[0..count], &buf) catch {
+                    self.registers[dst] = .{ .null_val = {} };
+                    return;
+                };
+                // Store serialized bytes as blob
+                const data = self.allocator.dupe(u8, buf[0..size]) catch {
+                    self.registers[dst] = .{ .null_val = {} };
+                    return;
+                };
+                self.registers[dst] = .{ .blob = data };
+            },
+            .insert => {
+                // p1 = cursor_id, p2 = record_reg (blob), p3 = rowid_reg
+                const cid: usize = @intCast(instr.p1);
+                const rec_reg: usize = @intCast(instr.p2);
+                const rid_reg: usize = @intCast(instr.p3);
+                if (self.cursors[cid]) |*cs| {
+                    const rowid_val = self.registers[rid_reg];
+                    const rid: i64 = switch (rowid_val) {
+                        .integer => |v| v,
+                        else => return,
+                    };
+                    const payload = switch (self.registers[rec_reg]) {
+                        .blob => |b| b,
+                        else => return,
+                    };
+                    cs.bt.insert(rid, payload) catch {};
+                    self.rows_affected += 1;
+                }
+            },
+
+            // Bind parameter: load bound param into register
+            .blob => {
+                // Used for bind params: p1 = dest_reg, p2 = param_index (1-based)
+                const reg: usize = @intCast(instr.p1);
+                const param_idx: usize = @intCast(instr.p2);
+                if (self.bound_params) |params| {
+                    if (param_idx > 0 and param_idx <= params.len) {
+                        self.registers[reg] = recordValueToRegister(params[param_idx - 1]);
+                    }
+                }
+            },
+
+            // Stubs for unimplemented opcodes
+            .delete, .idx_insert, .idx_search, .agg_step, .agg_final, .sorter_open, .sorter_insert, .sorter_sort, .sorter_data, .sorter_next, .transaction, .commit, .rollback, .move, .concat, .like, .compare, .prev_row => {},
         }
     }
 

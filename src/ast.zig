@@ -26,6 +26,7 @@ pub const Expr = union(enum) {
     like: Like,
     star: void, // SELECT *
     paren: *Expr, // parenthesised expression
+    placeholder: u32, // parameter placeholder (?), 1-based index
 
     pub const ColumnRef = struct {
         table: ?[]const u8,
