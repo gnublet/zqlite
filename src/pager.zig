@@ -63,6 +63,7 @@ pub const BufferPool = struct {
     file: *os.FileHandle,
     allocator: std.mem.Allocator,
     journal: ?*journal_mod.Journal,
+    next_page_id: u32, // monotonic counter for page allocation (not tied to file_size)
 
     const Self = @This();
 
@@ -99,6 +100,7 @@ pub const BufferPool = struct {
             .file = file,
             .allocator = allocator,
             .journal = null,
+            .next_page_id = file.pageCount(),
         };
     }
 
@@ -175,7 +177,8 @@ pub const BufferPool = struct {
 
     /// Allocate a new page at the end of the file.
     pub fn allocatePage(self: *Self) PagerError!*Page {
-        const new_page_id = self.file.pageCount();
+        const new_page_id = self.next_page_id;
+        self.next_page_id += 1;
         const page = try self.fetchPage(new_page_id);
         @memset(page.data, 0);
         page.dirty = true;

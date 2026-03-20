@@ -708,7 +708,7 @@ pub fn main() void {
 
     // Benchmark 1: Bulk Insert via SQL
     {
-        const count: u32 = 500;
+        const count: u32 = 5000;
         print("Running bulk_insert ({d} rows)...\n", .{count});
         const z = benchBulkInsertZqlite(allocator, count);
         const s = benchBulkInsertSqlite(count);
@@ -785,7 +785,7 @@ pub fn main() void {
     print("  * SQLite uses auto-commit per statement (rollback journal + fsync)\n", .{});
     print("  * ZQLite advantages: zero-copy allocator, PK fast-path (bt.search)\n", .{});
     print("  * SQLite advantages: prepared statements, decades of optimization, MVCC\n", .{});
-    print("  * ZQLite does not yet implement: WAL, page splitting,\n", .{});
+    print("  * ZQLite does not yet implement: WAL,\n", .{});
     print("    multi-table joins, indexes, or prepared statements\n", .{});
     print("  * Ratio > 1 = ZQLite faster, < 1 = SQLite faster\n", .{});
     print("\nBenchmark complete.\n", .{});

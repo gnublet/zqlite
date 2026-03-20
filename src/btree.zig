@@ -100,7 +100,7 @@ pub const BtreePage = struct {
     }
 
     /// Set the cell count.
-    fn setCellCount(self: *Self, count: u16) void {
+    pub fn setCellCount(self: *Self, count: u16) void {
         std.mem.writeInt(u16, self.page.data[3..5], count, .big);
     }
 
@@ -111,7 +111,7 @@ pub const BtreePage = struct {
     }
 
     /// Set the cell content area offset.
-    fn setCellContentOffset(self: *Self, offset: u16) void {
+    pub fn setCellContentOffset(self: *Self, offset: u16) void {
         std.mem.writeInt(u16, self.page.data[5..7], offset, .big);
     }
 
@@ -134,7 +134,7 @@ pub const BtreePage = struct {
     }
 
     /// Set the cell pointer at index `i`.
-    fn setCellPointer(self: *Self, i: u16, offset: u16) void {
+    pub fn setCellPointer(self: *Self, i: u16, offset: u16) void {
         const ptr_offset = self.headerSize() + i * 2;
         std.mem.writeInt(u16, self.page.data[ptr_offset..][0..2], offset, .big);
     }
@@ -213,22 +213,30 @@ pub const BtreePage = struct {
         const count = self.cellCount();
         var insert_idx: u16 = count;
 
-        // Binary search for correct position
+        // Fast-path: if new key > last key, append at end (common for sequential inserts)
         if (count > 0) {
-            var lo: u16 = 0;
-            var hi: u16 = count;
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                const mid_key = self.readCellKey(self.cellPointer(mid)) catch return BtreeError.CorruptPage;
-                if (mid_key < rowid) {
-                    lo = mid + 1;
-                } else if (mid_key > rowid) {
-                    hi = mid;
-                } else {
-                    return BtreeError.DuplicateKey;
+            const last_key = self.readCellKey(self.cellPointer(count - 1)) catch return BtreeError.CorruptPage;
+            if (rowid > last_key) {
+                insert_idx = count; // append at end, skip binary search
+            } else if (rowid == last_key) {
+                return BtreeError.DuplicateKey;
+            } else {
+                // Binary search for correct position
+                var lo: u16 = 0;
+                var hi: u16 = count;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    const mid_key = self.readCellKey(self.cellPointer(mid)) catch return BtreeError.CorruptPage;
+                    if (mid_key < rowid) {
+                        lo = mid + 1;
+                    } else if (mid_key > rowid) {
+                        hi = mid;
+                    } else {
+                        return BtreeError.DuplicateKey;
+                    }
                 }
+                insert_idx = lo;
             }
-            insert_idx = lo;
         }
 
         // Check if we have space
@@ -285,6 +293,124 @@ pub const BtreePage = struct {
         if (content_start <= ptr_array_end) return 0;
         return content_start - ptr_array_end;
     }
+
+    /// Insert an interior node cell: [left_child: u32][rowid: varint]
+    /// After insertion, updates right_child to point to new_right_child.
+    pub fn insertInteriorCell(self: *Self, key: i64, left_child: u32, new_right_child: u32) BtreeError!void {
+        // Encode cell: u32 left_child + varint rowid
+        var cell_buf: [20]u8 = undefined;
+        std.mem.writeInt(u32, cell_buf[0..4], left_child, .big);
+        const key_len = record.putVarint(cell_buf[4..], @bitCast(key)) catch return BtreeError.Overflow;
+        const cell_size: u16 = @intCast(4 + key_len);
+
+        // Find insertion point (binary search)
+        const count = self.cellCount();
+        var insert_idx: u16 = count;
+        const data = self.page.data;
+
+        if (count > 0) {
+            var lo: u16 = 0;
+            var hi: u16 = count;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const mid_off: usize = self.cellPointer(mid);
+                const mid_key_info = record.getVarint(data[mid_off + 4 ..]) catch return BtreeError.CorruptPage;
+                const mid_key: i64 = @bitCast(mid_key_info.value);
+                if (mid_key < key) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            insert_idx = lo;
+        }
+
+        // Check space
+        const content_start = self.cellContentOffset();
+        const ptr_array_end = self.headerSize() + (count + 1) * 2;
+        const new_content_start = content_start - cell_size;
+        if (new_content_start < ptr_array_end) return BtreeError.PageFull;
+
+        // Write cell content
+        @memcpy(self.page.data[new_content_start..content_start], cell_buf[0..cell_size]);
+
+        // Shift cell pointers
+        var i = count;
+        while (i > insert_idx) : (i -= 1) {
+            self.setCellPointer(i, self.cellPointer(i - 1));
+        }
+
+        self.setCellPointer(insert_idx, new_content_start);
+        self.setCellCount(count + 1);
+        self.setCellContentOffset(new_content_start);
+
+        // Update right child if inserting at the rightmost position
+        if (new_right_child != 0) {
+            // The new cell's left_child points to left_child.
+            // The right child carries the new_right_child if this is a split insertion.
+            // Find if we need to update right child:
+            // If the new key is greater than the old rightmost key, update right child.
+            if (insert_idx == count) {
+                self.setRightChild(new_right_child);
+            }
+        }
+
+        if (self.pool) |p| p.markPageDirty(self.page) else self.page.markDirty();
+    }
+
+    /// Truncate this page to keep only the first `keep` cells.
+    /// Compacts the remaining cells to reclaim space.
+    pub fn truncateCells(self: *Self, keep: u16) void {
+        const current = self.cellCount();
+        if (keep >= current) return;
+
+        // Read cell data for cells we want to keep
+        const data = self.page.data;
+        const psize: usize = @intCast(self.page_size);
+        var tmp_buf: [65536]u8 = undefined;
+        const tmp = tmp_buf[0..psize];
+        var sizes_buf: [4096]u16 = undefined;
+        var tmp_pos: usize = 0;
+
+        const is_leaf = self.isLeaf();
+
+        var k: u16 = 0;
+        while (k < keep) : (k += 1) {
+            const cell_off: usize = self.cellPointer(k);
+            var cs: u16 = 0;
+
+            if (is_leaf) {
+                // Leaf cell: varint(payload_size) + varint(rowid) + payload
+                const pinfo = record.getVarint(data[cell_off..]) catch break;
+                const rinfo = record.getVarint(data[cell_off + pinfo.bytes ..]) catch break;
+                const payload_size: usize = @intCast(pinfo.value);
+                cs = @intCast(pinfo.bytes + rinfo.bytes + payload_size);
+            } else {
+                // Interior cell: u32(left_child) + varint(rowid)
+                const kinfo = record.getVarint(data[cell_off + 4 ..]) catch break;
+                cs = @intCast(4 + kinfo.bytes);
+            }
+
+            sizes_buf[k] = cs;
+            @memcpy(tmp[tmp_pos..][0..cs], data[cell_off..][0..cs]);
+            tmp_pos += cs;
+        }
+
+        // Rewrite compacted from end of page
+        var write_pos: u16 = @intCast(self.page_size);
+        tmp_pos = 0;
+        k = 0;
+        while (k < keep) : (k += 1) {
+            const cs = sizes_buf[k];
+            write_pos -= cs;
+            @memcpy(data[write_pos..][0..cs], tmp[tmp_pos..][0..cs]);
+            self.setCellPointer(k, write_pos);
+            tmp_pos += cs;
+        }
+        self.setCellCount(keep);
+        self.setCellContentOffset(write_pos);
+        if (self.pool) |p| p.markPageDirty(self.page) else self.page.markDirty();
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -297,6 +423,12 @@ pub const Btree = struct {
     page_size: u32,
 
     const Self = @This();
+
+    /// Result of a page split: the new sibling page and the promoted key.
+    const SplitResult = struct {
+        new_page_id: u32,
+        median_key: i64,
+    };
 
     /// Create a new B-tree with an empty root leaf page.
     pub fn create(pool: *pager.BufferPool, page_type: u8) BtreeError!Self {
@@ -322,109 +454,306 @@ pub const Btree = struct {
         };
     }
 
-    /// Insert a row into a table B-tree.
+    /// Insert a row into a table B-tree with automatic page splitting.
     pub fn insert(self: *Self, rowid: i64, payload: []const u8) BtreeError!void {
-        const page = self.pool.fetchPage(self.root_page_id) catch return BtreeError.PagerError;
-        defer self.pool.releasePage(page);
+        const split = try self.insertRecursive(self.root_page_id, rowid, payload);
 
-        var bp = BtreePage{ .page = page, .page_size = self.page_size, .pool = self.pool };
-
-        // For now, only support single-page leaf (splitting comes later)
-        if (bp.isLeaf()) {
-            bp.insertTableLeafCell(rowid, payload) catch |err| {
-                switch (err) {
-                    BtreeError.PageFull => {
-                        // TODO: implement page splitting
-                        return BtreeError.PageFull;
-                    },
-                    else => return err,
-                }
-            };
+        // If the root page split, create a new root interior node
+        if (split) |s| {
+            try self.createNewRoot(s.median_key, s.new_page_id);
         }
     }
 
-    /// Search for a rowid. Returns the payload if found.
-    pub fn search(self: *Self, rowid: i64) BtreeError!?Cell {
-        const page = self.pool.fetchPage(self.root_page_id) catch return BtreeError.PagerError;
+    /// Recursive insert: descend to the correct leaf, insert, split if needed.
+    /// Returns SplitResult if this page was split, null otherwise.
+    fn insertRecursive(self: *Self, page_id: u32, rowid: i64, payload: []const u8) BtreeError!?SplitResult {
+        const page = self.pool.fetchPage(page_id) catch return BtreeError.PagerError;
         defer self.pool.releasePage(page);
 
         var bp = BtreePage{ .page = page, .page_size = self.page_size, .pool = self.pool };
 
         if (bp.isLeaf()) {
-            const idx = try bp.searchTableLeaf(rowid);
-            if (idx) |i| {
-                return try bp.readTableLeafCell(bp.cellPointer(i));
-            }
+            // Try to insert into this leaf
+            bp.insertTableLeafCell(rowid, payload) catch |err| {
+                if (err == BtreeError.PageFull) {
+                    return try self.splitLeafAndInsert(page_id, rowid, payload);
+                }
+                return err;
+            };
+            return null;
         }
 
+        // Interior node: find correct child to descend into
+        const child_page_id = try self.findChildPage(&bp, rowid);
+        const child_split = try self.insertRecursive(child_page_id, rowid, payload);
+
+        // If the child page split, insert the separator key here
+        if (child_split) |cs| {
+            // Interior cell format: [left_child=child_page_id] [key=median]
+            // right_child is updated to cs.new_page_id
+            bp.insertInteriorCell(cs.median_key, child_page_id, cs.new_page_id) catch |err| {
+                if (err == BtreeError.PageFull) {
+                    return try self.splitInteriorAndInsert(page_id, cs.median_key, child_page_id, cs.new_page_id);
+                }
+                return err;
+            };
+        }
         return null;
     }
 
-    /// Delete a rowid from a table B-tree.
-    /// Currently only supports single-leaf deletion (no rebalancing).
-    /// Defragments the page after deletion to reclaim cell content space.
-    pub fn delete(self: *Self, rowid: i64) BtreeError!bool {
-        const page = self.pool.fetchPage(self.root_page_id) catch return BtreeError.PagerError;
-        defer self.pool.releasePage(page);
+    /// Find which child page to descend into for a given rowid.
+    fn findChildPage(self: *Self, bp: *BtreePage, rowid: i64) BtreeError!u32 {
+        _ = self;
+        const count = bp.cellCount();
+        const data = bp.page.data;
 
-        var bp = BtreePage{ .page = page, .page_size = self.page_size, .pool = self.pool };
-
-        if (bp.isLeaf()) {
-            const idx = try bp.searchTableLeaf(rowid);
-            if (idx) |i| {
-                // Remove cell by shifting pointers
-                const count = bp.cellCount();
-                var j = i;
-                while (j < count - 1) : (j += 1) {
-                    bp.setCellPointer(j, bp.cellPointer(j + 1));
-                }
-                const new_count = count - 1;
-                bp.setCellCount(new_count);
-
-                // Defragment: compact all surviving cells to reclaim freed space.
-                // Two-pass: first read all cell data, then write back compacted.
-                const data = bp.page.data;
-                const psize: usize = @intCast(bp.page_size);
-
-                // Pass 1: collect all cell content into a temp buffer
-                // Cell content can't exceed page size. Cell count can't exceed page_size/4.
-                var tmp_buf: [65536]u8 = undefined; // max page size
-                const tmp = tmp_buf[0..psize];
-                var sizes_buf: [4096]u16 = undefined; // max ~4096 cells
-                var tmp_pos: usize = 0;
-                var cell_count: usize = 0;
-
-                var k: u16 = 0;
-                while (k < new_count) : (k += 1) {
-                    const cell_off: usize = bp.cellPointer(k);
-                    const pinfo = record.getVarint(data[cell_off..]) catch return BtreeError.CorruptPage;
-                    const rinfo = record.getVarint(data[cell_off + pinfo.bytes ..]) catch return BtreeError.CorruptPage;
-                    const payload_size: usize = @intCast(pinfo.value);
-                    const cs: u16 = @intCast(pinfo.bytes + rinfo.bytes + payload_size);
-                    sizes_buf[cell_count] = cs;
-                    @memcpy(tmp[tmp_pos..][0..cs], data[cell_off..][0..cs]);
-                    tmp_pos += cs;
-                    cell_count += 1;
-                }
-
-                // Pass 2: write cells back compacted from end of page
-                var write_pos: u16 = @intCast(bp.page_size);
-                tmp_pos = 0;
-                k = 0;
-                while (k < new_count) : (k += 1) {
-                    const cs = sizes_buf[k];
-                    write_pos -= cs;
-                    @memcpy(data[write_pos..][0..cs], tmp[tmp_pos..][0..cs]);
-                    bp.setCellPointer(k, write_pos);
-                    tmp_pos += cs;
-                }
-                bp.setCellContentOffset(write_pos);
-
-                bp.page.markDirty();
-                return true;
+        // Binary search: find first cell with key >= rowid
+        var lo: u16 = 0;
+        var hi: u16 = count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const cell_off: usize = bp.cellPointer(mid);
+            const key_info = record.getVarint(data[cell_off + 4 ..]) catch return BtreeError.CorruptPage;
+            const key: i64 = @bitCast(key_info.value);
+            if (rowid < key) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
             }
         }
-        return false;
+
+        if (lo < count) {
+            // Go to the left child of cell[lo]
+            const cell_off: usize = bp.cellPointer(lo);
+            return std.mem.readInt(u32, data[cell_off..][0..4], .big);
+        } else {
+            // rowid is greater than all keys — go to right child
+            return bp.rightChild();
+        }
+    }
+
+    /// Split a full leaf page and insert the new cell into the correct half.
+    fn splitLeafAndInsert(self: *Self, page_id: u32, rowid: i64, payload: []const u8) BtreeError!SplitResult {
+        const page = self.pool.fetchPage(page_id) catch return BtreeError.PagerError;
+        defer self.pool.releasePage(page);
+        var bp = BtreePage{ .page = page, .page_size = self.page_size, .pool = self.pool };
+
+        // Allocate new right sibling
+        const new_page = self.pool.allocatePage() catch return BtreeError.PagerError;
+        defer self.pool.releasePage(new_page);
+        var new_bp = BtreePage{ .page = new_page, .page_size = self.page_size, .pool = self.pool };
+        new_bp.initPage(PAGE_TYPE_TABLE_LEAF);
+
+        const count = bp.cellCount();
+        const mid = count / 2;
+
+        // Read the median key (promoted to parent)
+        const median_key = bp.readCellKey(bp.cellPointer(mid)) catch return BtreeError.CorruptPage;
+
+        // Copy cells [mid..count) to new page
+        var i: u16 = mid;
+        while (i < count) : (i += 1) {
+            const cell = bp.readTableLeafCell(bp.cellPointer(i)) catch return BtreeError.CorruptPage;
+            new_bp.insertTableLeafCell(cell.key, cell.payload) catch return BtreeError.PagerError;
+        }
+
+        // Truncate original page to [0..mid)
+        bp.truncateCells(mid);
+
+        // Insert new cell into the correct half
+        if (rowid < median_key) {
+            bp.insertTableLeafCell(rowid, payload) catch return BtreeError.PageFull;
+        } else {
+            new_bp.insertTableLeafCell(rowid, payload) catch return BtreeError.PageFull;
+        }
+
+        return SplitResult{
+            .new_page_id = new_page.page_id,
+            .median_key = median_key,
+        };
+    }
+
+    /// Split a full interior page and insert a separator.
+    fn splitInteriorAndInsert(self: *Self, page_id: u32, key: i64, left_child: u32, right_child: u32) BtreeError!SplitResult {
+        const page = self.pool.fetchPage(page_id) catch return BtreeError.PagerError;
+        defer self.pool.releasePage(page);
+        var bp = BtreePage{ .page = page, .page_size = self.page_size, .pool = self.pool };
+
+        // Allocate right sibling
+        const new_page = self.pool.allocatePage() catch return BtreeError.PagerError;
+        defer self.pool.releasePage(new_page);
+        var new_bp = BtreePage{ .page = new_page, .page_size = self.page_size, .pool = self.pool };
+        new_bp.initPage(PAGE_TYPE_TABLE_INTERIOR);
+
+        const count = bp.cellCount();
+        const mid = count / 2;
+        const data = bp.page.data;
+
+        // Median cell's key is promoted
+        const mid_off: usize = bp.cellPointer(mid);
+        const mid_key_info = record.getVarint(data[mid_off + 4 ..]) catch return BtreeError.CorruptPage;
+        const promoted_key: i64 = @bitCast(mid_key_info.value);
+
+        // Copy cells [mid+1..count) to new page
+        var i: u16 = mid + 1;
+        while (i < count) : (i += 1) {
+            const cell_off: usize = bp.cellPointer(i);
+            const child = std.mem.readInt(u32, data[cell_off..][0..4], .big);
+            const k_info = record.getVarint(data[cell_off + 4 ..]) catch return BtreeError.CorruptPage;
+            const k: i64 = @bitCast(k_info.value);
+            new_bp.insertInteriorCell(k, child, 0) catch return BtreeError.PagerError;
+        }
+
+        // New page's right child = old page's right child
+        new_bp.setRightChild(bp.rightChild());
+
+        // Old page's right child = median cell's left child
+        const median_left = std.mem.readInt(u32, data[mid_off..][0..4], .big);
+        bp.setRightChild(median_left);
+
+        // Truncate old page to [0..mid)
+        bp.truncateCells(mid);
+
+        // Insert new separator into correct half
+        if (key < promoted_key) {
+            bp.insertInteriorCell(key, left_child, right_child) catch return BtreeError.PageFull;
+        } else {
+            new_bp.insertInteriorCell(key, left_child, right_child) catch return BtreeError.PageFull;
+        }
+
+        return SplitResult{
+            .new_page_id = new_page.page_id,
+            .median_key = promoted_key,
+        };
+    }
+
+    /// Create a new root interior node after the root page splits.
+    /// Copies old root content to a new left child, then reinitializes
+    /// the root as an interior node pointing to both children.
+    fn createNewRoot(self: *Self, median_key: i64, right_page_id: u32) BtreeError!void {
+        // Allocate new page to hold old root's content (becomes left child)
+        const new_left = self.pool.allocatePage() catch return BtreeError.PagerError;
+        const new_left_id = new_left.page_id;
+
+        // Copy old root data to new left child
+        const root_page = self.pool.fetchPage(self.root_page_id) catch {
+            self.pool.releasePage(new_left);
+            return BtreeError.PagerError;
+        };
+
+        @memcpy(new_left.data[0..self.page_size], root_page.data[0..self.page_size]);
+        new_left.page_id = new_left_id;
+        self.pool.markPageDirty(new_left);
+        self.pool.releasePage(new_left);
+
+        // Reinitialize root as interior node
+        var root_bp = BtreePage{ .page = root_page, .page_size = self.page_size, .pool = self.pool };
+        root_bp.initPage(PAGE_TYPE_TABLE_INTERIOR);
+        root_bp.setRightChild(right_page_id);
+
+        // Write single separator cell: left_child=new_left_id, key=median_key
+        var cell_buf: [20]u8 = undefined;
+        std.mem.writeInt(u32, cell_buf[0..4], new_left_id, .big);
+        const key_len = record.putVarint(cell_buf[4..], @bitCast(median_key)) catch return BtreeError.Overflow;
+        const cell_size: u16 = @intCast(4 + key_len);
+
+        const content_start = root_bp.cellContentOffset() - cell_size;
+        @memcpy(root_page.data[content_start..][0..cell_size], cell_buf[0..cell_size]);
+        root_bp.setCellPointer(0, content_start);
+        root_bp.setCellCount(1);
+        root_bp.setCellContentOffset(content_start);
+
+        self.pool.markPageDirty(root_page);
+        self.pool.releasePage(root_page);
+    }
+
+    /// Search for a rowid, traversing interior nodes to find the correct leaf.
+    pub fn search(self: *Self, rowid: i64) BtreeError!?Cell {
+        var page_id = self.root_page_id;
+
+        while (true) {
+            const page = self.pool.fetchPage(page_id) catch return BtreeError.PagerError;
+            defer self.pool.releasePage(page);
+
+            var bp = BtreePage{ .page = page, .page_size = self.page_size, .pool = self.pool };
+
+            if (bp.isLeaf()) {
+                const idx = try bp.searchTableLeaf(rowid);
+                if (idx) |i| {
+                    return try bp.readTableLeafCell(bp.cellPointer(i));
+                }
+                return null;
+            }
+
+            // Interior: descend
+            page_id = try self.findChildPage(&bp, rowid);
+        }
+    }
+
+    /// Delete a rowid, traversing interior nodes to find the correct leaf.
+    /// Defragments the leaf page after deletion.
+    pub fn delete(self: *Self, rowid: i64) BtreeError!bool {
+        var page_id = self.root_page_id;
+
+        while (true) {
+            const page = self.pool.fetchPage(page_id) catch return BtreeError.PagerError;
+            defer self.pool.releasePage(page);
+
+            var bp = BtreePage{ .page = page, .page_size = self.page_size, .pool = self.pool };
+
+            if (bp.isLeaf()) {
+                const idx = try bp.searchTableLeaf(rowid);
+                if (idx) |i| {
+                    const count = bp.cellCount();
+                    var j = i;
+                    while (j < count - 1) : (j += 1) {
+                        bp.setCellPointer(j, bp.cellPointer(j + 1));
+                    }
+                    const new_count = count - 1;
+                    bp.setCellCount(new_count);
+
+                    // Defragment
+                    const data = bp.page.data;
+                    const psize: usize = @intCast(bp.page_size);
+                    var tmp_buf: [65536]u8 = undefined;
+                    const tmp = tmp_buf[0..psize];
+                    var sizes_buf: [4096]u16 = undefined;
+                    var tmp_pos: usize = 0;
+                    var cell_count: usize = 0;
+
+                    var k: u16 = 0;
+                    while (k < new_count) : (k += 1) {
+                        const cell_off: usize = bp.cellPointer(k);
+                        const pinfo = record.getVarint(data[cell_off..]) catch return BtreeError.CorruptPage;
+                        const rinfo = record.getVarint(data[cell_off + pinfo.bytes ..]) catch return BtreeError.CorruptPage;
+                        const payload_size: usize = @intCast(pinfo.value);
+                        const cs: u16 = @intCast(pinfo.bytes + rinfo.bytes + payload_size);
+                        sizes_buf[cell_count] = cs;
+                        @memcpy(tmp[tmp_pos..][0..cs], data[cell_off..][0..cs]);
+                        tmp_pos += cs;
+                        cell_count += 1;
+                    }
+
+                    var write_pos: u16 = @intCast(bp.page_size);
+                    tmp_pos = 0;
+                    k = 0;
+                    while (k < new_count) : (k += 1) {
+                        const cs = sizes_buf[k];
+                        write_pos -= cs;
+                        @memcpy(data[write_pos..][0..cs], tmp[tmp_pos..][0..cs]);
+                        bp.setCellPointer(k, write_pos);
+                        tmp_pos += cs;
+                    }
+                    bp.setCellContentOffset(write_pos);
+                    bp.page.markDirty();
+                    return true;
+                }
+                return false;
+            }
+
+            // Interior: descend
+            page_id = try self.findChildPage(&bp, rowid);
+        }
     }
 };
 

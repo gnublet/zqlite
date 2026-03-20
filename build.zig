@@ -43,6 +43,7 @@ pub fn build(b: *std.Build) void {
         "tests/test_vm.zig",
         "tests/test_integration.zig",
         "tests/test_executor.zig",
+        "tests/test_split.zig",
     };
 
     const test_step = b.step("test", "Run all ZQLite tests");

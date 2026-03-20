@@ -255,6 +255,8 @@ pub const Executor = struct {
             j.commit() catch return ExecError.StorageError;
         }
         self.in_transaction = false;
+        // Persist schema at end of transaction (deferred from individual INSERTs)
+        self.persistSchema();
         return ExecResult{ .rows = &.{}, .column_names = &.{}, .rows_affected = 0, .message = "Transaction committed" };
     }
 
@@ -372,6 +374,7 @@ pub const Executor = struct {
             return ExecError.TableNotFound;
 
         var bt = btree.Btree.open(self.pool, table_entry.root_page);
+        var current_next_rowid = table_entry.next_rowid;
 
         var rows_inserted: usize = 0;
 
@@ -402,23 +405,26 @@ pub const Executor = struct {
                 };
             } else {
                 // Auto-increment
-                rowid = table_entry.next_rowid;
+                rowid = current_next_rowid;
             }
 
             // Insert into B-tree
             bt.insert(rowid, buf[0..rec_size]) catch return ExecError.StorageError;
 
-            // Update next_rowid in schema
-            var updated = self.schema_store.getTable(ins.table) orelse
-                return ExecError.TableNotFound;
-            updated.next_rowid = @max(updated.next_rowid, rowid + 1);
-            self.schema_store.addTable(updated) catch return ExecError.StorageError;
+            // Track next_rowid locally (avoid schema store lookup per row)
+            current_next_rowid = @max(current_next_rowid, rowid + 1);
 
             rows_inserted += 1;
         }
 
-        // Persist schema (next_rowid may have changed)
-        self.persistSchema();
+        // Update schema once after all rows
+        var updated = self.schema_store.getTable(ins.table) orelse
+            return ExecError.TableNotFound;
+        updated.next_rowid = current_next_rowid;
+        self.schema_store.addTable(updated) catch return ExecError.StorageError;
+
+        // Only persist schema if not in explicit transaction (deferred to COMMIT)
+        if (!self.in_transaction) self.persistSchema();
 
         return ExecResult{
             .rows = &.{},
