@@ -358,9 +358,9 @@ pub const Cursor = struct {
         }
     }
 
-    /// Seek to the first index entry matching `key_bytes` (or the first entry >= key_bytes).
+    /// Seek to the first index entry matching `search_val` (or the first entry >= search_val).
     /// Returns true if an exact match is found.
-    pub fn seekIndex(self: *Self, key_bytes: []const u8) CursorError!bool {
+    pub fn seekIndex(self: *Self, search_val: record.Value) CursorError!bool {
         self.depth = 0;
         self.valid = false;
 
@@ -376,40 +376,24 @@ pub const Cursor = struct {
             var hi: u16 = count;
             while (lo < hi) {
                 const mid = lo + (hi - lo) / 2;
-                if (bp.isLeaf()) {
+                const mid_payload: []const u8 = if (bp.isLeaf()) blk: {
                     const mid_cell = bp.readIndexCell(bp.cellPointer(mid)) catch return CursorError.BtreeError;
-                    const cmp = std.mem.order(u8, mid_cell.key, key_bytes);
-                    switch (cmp) {
-                        .lt => lo = mid + 1,
-                        .gt => hi = mid,
-                        .eq => hi = mid, // Narrow to find the very first match
-                    }
-                } else {
-                    // Interior Index Cell: left_child(4) + payload_size + key_bytes + rowid
-                    // Actually, we can just read it like a leaf cell, but offset by 4 bytes.
+                    break :blk mid_cell.key;
+                } else blk: {
                     var cell_off = bp.cellPointer(mid);
                     cell_off += 4; // skip left child pointer
                     const ps_info = record.getVarint(page.data[cell_off..]) catch return CursorError.BtreeError;
                     const payload_size: usize = @intCast(ps_info.value);
                     const payload_start = cell_off + ps_info.bytes;
-                    
-                    // Extract key bytes from payload (like readIndexCell)
-                    var pos = payload_start;
-                    var last_varint_start = pos;
-                    const payload_end = payload_start + payload_size;
-                    while (pos < payload_end) {
-                        last_varint_start = pos;
-                        const vi = record.getVarint(page.data[pos..]) catch return CursorError.BtreeError;
-                        pos += vi.bytes;
-                    }
-                    const mid_key_bytes = page.data[payload_start..last_varint_start];
-                    
-                    const cmp = std.mem.order(u8, mid_key_bytes, key_bytes);
-                    switch (cmp) {
-                        .lt => lo = mid + 1,
-                        .gt => hi = mid,
-                        .eq => hi = mid,
-                    }
+                    break :blk page.data[payload_start .. payload_start + payload_size];
+                };
+
+                const mid_val = record.readColumn(mid_payload, 0) catch return CursorError.BtreeError;
+                const cmp = record.valueOrder(mid_val, search_val);
+                switch (cmp) {
+                    .lt => lo = mid + 1,
+                    .gt => hi = mid,
+                    .eq => hi = mid, // Narrow to find the very first match
                 }
             }
 
@@ -423,7 +407,8 @@ pub const Cursor = struct {
                 if (lo < count) {
                     self.valid = true;
                     const idx_cell = bp.readIndexCell(bp.cellPointer(lo)) catch return CursorError.BtreeError;
-                    return std.mem.eql(u8, idx_cell.key, key_bytes);
+                    const lo_val = record.readColumn(idx_cell.key, 0) catch return CursorError.BtreeError;
+                    return record.valueOrder(lo_val, search_val) == .eq;
                 }
                 return false;
             } else {
@@ -449,8 +434,8 @@ pub const Cursor = struct {
         return idx_cell.rowid;
     }
 
-    /// Returns true if the current index cell's key exactly matches `key_bytes`.
-    pub fn indexKeyEquals(self: *Self, key_bytes: []const u8) CursorError!bool {
+    /// Returns true if the current index cell's key exactly matches `search_val`.
+    pub fn indexKeyEquals(self: *Self, search_val: record.Value) CursorError!bool {
         if (!self.valid) return CursorError.InvalidPosition;
 
         const entry = self.stack[self.depth - 1];
@@ -458,7 +443,8 @@ pub const Cursor = struct {
         const bp = btree.BtreePage{ .page = page, .page_size = self.bt.page_size, .pool = null };
         
         const idx_cell = bp.readIndexCell(bp.cellPointer(entry.cell_index)) catch return CursorError.BtreeError;
-        return std.mem.eql(u8, idx_cell.key, key_bytes);
+        const cur_val = record.readColumn(idx_cell.key, 0) catch return CursorError.BtreeError;
+        return record.valueOrder(cur_val, search_val) == .eq;
     }
 };
 

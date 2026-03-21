@@ -603,3 +603,39 @@ test "serial type sizing" {
     // text "hi" → 13 + 2*2 = 17
     try std.testing.expectEqual(@as(u64, 17), serialType(.{ .text = "hi" }));
 }
+
+/// Compare two Record Values completely natively using their enum variants.
+pub fn valueOrder(a: Value, b: Value) std.math.Order {
+    if (std.meta.activeTag(a) == .null_val and std.meta.activeTag(b) == .null_val) return .eq;
+    if (std.meta.activeTag(a) == .null_val) return .lt; // Null is less than everything
+    if (std.meta.activeTag(b) == .null_val) return .gt;
+
+    if (std.meta.activeTag(a) == .integer and std.meta.activeTag(b) == .integer) {
+        if (a.integer < b.integer) return .lt;
+        if (a.integer > b.integer) return .gt;
+        return .eq;
+    }
+
+    if (std.meta.activeTag(a) == .text and std.meta.activeTag(b) == .text) {
+        return std.mem.order(u8, a.text, b.text);
+    }
+
+    if (std.meta.activeTag(a) == .blob and std.meta.activeTag(b) == .blob) {
+        return std.mem.order(u8, a.blob, b.blob);
+    }
+
+    // Coerce to real if either is real
+    const af: f64 = switch (a) {
+        .integer => |v| @floatFromInt(v),
+        .real => |v| v,
+        else => return .lt, // Incompatible type comparison fallback
+    };
+    const bf: f64 = switch (b) {
+        .integer => |v| @floatFromInt(v),
+        .real => |v| v,
+        else => return .gt,
+    };
+    if (af < bf) return .lt;
+    if (af > bf) return .gt;
+    return .eq;
+}

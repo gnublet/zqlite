@@ -71,6 +71,6 @@ test "pager: allocate page" {
 
     const p = try pool.allocatePage();
     try std.testing.expect(p.dirty);
-    try std.testing.expectEqual(@as(u32, 0), p.page_id);
+    try std.testing.expectEqual(@as(u32, 1), p.page_id);
     pool.releasePage(p);
 }

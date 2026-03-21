@@ -493,14 +493,8 @@ pub const VM = struct {
                 if (self.cursors[cid]) |*cs| {
                     cs.header_cache.reset();
                     const search_key_val = self.registers[key_reg].toRecordValue();
-                    var buf: [4096]u8 = undefined;
-                    const size = record.serializeRecord(&[_]record.Value{search_key_val}, &buf) catch {
-                        self.pc = jump_pc;
-                        continue;
-                    };
-                    const key_bytes = buf[0..size];
 
-                    const found = cs.cur.seekIndex(key_bytes) catch false;
+                    const found = cs.cur.seekIndex(search_key_val) catch false;
                     cs.valid = cs.cur.valid;
                     if (!found) {
                         self.pc = jump_pc;
@@ -518,11 +512,8 @@ pub const VM = struct {
                     cs.header_cache.reset();
                     if (cs.cur.next() catch false) {
                         const search_key_val = self.registers[key_reg].toRecordValue();
-                        var buf: [4096]u8 = undefined;
-                        const size = record.serializeRecord(&[_]record.Value{search_key_val}, &buf) catch continue;
-                        const key_bytes = buf[0..size];
                         
-                        const matches = cs.cur.indexKeyEquals(key_bytes) catch false;
+                        const matches = cs.cur.indexKeyEquals(search_key_val) catch false;
                         if (matches) {
                             self.pc = jump_pc;
                         } else {
@@ -625,6 +616,34 @@ pub const VM = struct {
                 .le => av <= bv,
                 .gt => av > bv,
                 .ge => av >= bv,
+                else => false,
+            };
+        }
+
+        // Compare strings
+        if (a == .text and b == .text) {
+            const cmp = std.mem.order(u8, a.text, b.text);
+            return switch (op) {
+                .eq => cmp == .eq,
+                .ne => cmp != .eq,
+                .lt => cmp == .lt,
+                .le => cmp != .gt,
+                .gt => cmp == .gt,
+                .ge => cmp != .lt,
+                else => false,
+            };
+        }
+
+        // Compare blobs
+        if (a == .blob and b == .blob) {
+            const cmp = std.mem.order(u8, a.blob, b.blob);
+            return switch (op) {
+                .eq => cmp == .eq,
+                .ne => cmp != .eq,
+                .lt => cmp == .lt,
+                .le => cmp != .gt,
+                .gt => cmp == .gt,
+                .ge => cmp != .lt,
                 else => false,
             };
         }

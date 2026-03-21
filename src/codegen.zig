@@ -82,10 +82,10 @@ pub const Compiler = struct {
         }
 
         return .{
-            .instructions = self.instructions.items,
+            .instructions = self.instructions.toOwnedSlice(self.allocator) catch return CodegenError.AllocationFailed,
             .num_registers = self.next_reg,
             .num_cursors = self.num_cursors,
-            .column_names = self.column_names.items,
+            .column_names = self.column_names.toOwnedSlice(self.allocator) catch return CodegenError.AllocationFailed,
         };
     }
 

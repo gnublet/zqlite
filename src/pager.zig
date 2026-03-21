@@ -100,7 +100,7 @@ pub const BufferPool = struct {
             .file = file,
             .allocator = allocator,
             .journal = null,
-            .next_page_id = file.pageCount(),
+            .next_page_id = if (file.pageCount() == 0) 1 else file.pageCount(),
         };
     }
 
